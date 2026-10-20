@@ -1,0 +1,189 @@
+# Builds, tests and packages Fotowache on macOS, Windows and Linux.
+#
+# Every push and pull request: build + unit tests + packages + smoke test
+# (develops two real RAW files on each system, see scripts/rauchtest.sh).
+# A tag v* additionally collects all packages into a DRAFT release with
+# SHA256SUMS.txt — it is published by hand after the packages were checked.
+
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  LIBRAW_KEY: libraw-0.22.2-jpeg-3.1.4.1-omp-v1
+
+jobs:
+  linux:
+    name: Linux ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            arch: x86_64
+          - runner: ubuntu-22.04-arm
+            arch: aarch64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: System packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential cmake pkg-config zlib1g-dev \
+            libxkbcommon-dev libwayland-dev mesa-vulkan-drivers libvulkan1 file  # Kennung: Paketnamen
+      - name: Cache LibRaw
+        uses: actions/cache@v4
+        with:
+          path: target/libraw-statisch
+          key: ${{ env.LIBRAW_KEY }}-linux-${{ matrix.arch }}-${{ hashFiles('scripts/libraw-bauen.sh') }}
+      - name: Build LibRaw (static)
+        run: |
+          [ -f target/libraw-statisch/lib/libraw_r.a ] || scripts/libraw-bauen.sh target/libraw-statisch
+          echo "LIBRAW_DIR=$PWD/target/libraw-statisch" >> "$GITHUB_ENV"
+      - name: Unit tests
+        run: cargo test --release
+      - name: Package
+        run: scripts/paket-linux.sh
+      - name: Smoke test (software renderer)
+        run: scripts/rauchtest.sh dist/Fotowache-*-linux-${{ matrix.arch }}/fotowache
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ matrix.arch }}
+          path: |
+            dist/*.tar.gz
+            dist/*.AppImage
+          if-no-files-found: error
+
+  macos:
+    name: macOS ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x86_64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: OpenMP runtime
+        run: brew install libomp
+      - name: Cache LibRaw
+        uses: actions/cache@v4
+        with:
+          path: target/libraw-statisch
+          key: ${{ env.LIBRAW_KEY }}-macos-${{ matrix.arch }}-${{ hashFiles('scripts/libraw-bauen.sh') }}
+      - name: Build LibRaw (static)
+        run: |
+          [ -f target/libraw-statisch/lib/libraw_r.a ] || scripts/libraw-bauen.sh target/libraw-statisch
+          echo "LIBRAW_DIR=$PWD/target/libraw-statisch" >> "$GITHUB_ENV"
+      - name: Unit tests
+        run: cargo test --release
+      - name: Package
+        run: scripts/paket-macos.sh
+      - name: Smoke test
+        run: scripts/rauchtest.sh dist/Fotowache.app/Contents/MacOS/Fotowache
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ matrix.arch }}
+          path: |
+            dist/*.dmg
+            dist/*.zip
+          if-no-files-found: error
+
+  windows:
+    name: Windows x64
+    runs-on: windows-2022
+    env:
+      # vcpkg revision with LibRaw 0.22.2
+      VCPKG_COMMIT: 1390a3d90e08a7901a7781d31332a662102cd5cc
+      RUSTFLAGS: -C target-feature=+crt-static
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Cache LibRaw
+        uses: actions/cache@v4
+        with:
+          path: vcpkg-libraw
+          key: ${{ env.LIBRAW_KEY }}-windows-vcpkg-${{ env.VCPKG_COMMIT }}
+      - name: Build LibRaw (static, vcpkg)
+        shell: pwsh
+        run: |
+          $ziel = "$PWD\vcpkg-libraw"
+          if (-not (Test-Path "$ziel\lib\raw_r.lib")) {
+            $v = $env:VCPKG_INSTALLATION_ROOT
+            git -C $v fetch --depth 1 origin $env:VCPKG_COMMIT
+            git -C $v checkout --force FETCH_HEAD
+            & "$v\bootstrap-vcpkg.bat" -disableMetrics
+            & "$v\vcpkg.exe" install "libraw[core,openmp,dng-lossy]:x64-windows-static" --clean-after-build
+            if ($LASTEXITCODE -ne 0) { throw "vcpkg failed" }
+            Copy-Item -Recurse "$v\installed\x64-windows-static" $ziel
+          }
+          "LIBRAW_DIR=$ziel" >> $env:GITHUB_ENV
+      - name: Unit tests
+        run: cargo test --release
+      - name: Inno Setup
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) {
+            choco install innosetup -y --no-progress
+          }
+      - name: Package
+        shell: pwsh
+        run: .\scripts\paket-windows.ps1
+      - name: Smoke test
+        shell: bash
+        run: scripts/rauchtest.sh dist/Fotowache-windows/fotowache.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64
+          path: |
+            dist/*.zip
+            dist/*-setup.exe
+          if-no-files-found: error
+
+  release:
+    name: Draft release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [linux, macos, windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: cd dist && sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt
+      - name: Release notes from CHANGELOG.md
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          awk -v v="$version" '
+            $0 ~ "^## \\[?" v "\\]?" {on=1; next}
+            on && /^## / {exit}
+            on {print}
+          ' CHANGELOG.md > notes.md
+          [ -s notes.md ] || echo "Fotowache $version" > notes.md
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --draft --title "Fotowache ${GITHUB_REF_NAME#v}" --notes-file notes.md

@@ -1,0 +1,3 @@
+// Ressourcen der fotowache.exe: Programmsymbol fuer Dateimanager,
+// Taskleiste und Startmenue. Eingebunden von crates/app/build.rs.
+1 ICON "fotowache.ico"

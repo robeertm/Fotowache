@@ -1,0 +1,4 @@
+target/
+dist/
+testdata/
+.DS_Store
