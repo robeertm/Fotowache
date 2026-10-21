@@ -15,6 +15,21 @@ pub const HUE_NAMES: [&str; 8] = [
     "Rot", "Orange", "Gelb", "Grün", "Türkis", "Blau", "Violett", "Magenta",
 ];
 
+/// Ein eingesetztes Stueck (siehe `zusatz`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Zusatz {
+    /// Dateiname des erzeugten Bildes neben dem Foto.
+    pub datei: String,
+    /// Bereich im ganzen Bild als Anteile: x0, y0, x1, y1.
+    pub kasten: [f32; 4],
+    /// Normierung beim Ausschneiden.
+    pub weiss: f32,
+    /// Markierte Stellen [x, y, radius] als Anteile.
+    pub flecken: Vec<[f32; 3]>,
+    /// Was hinzukommen sollte (Beschreibung).
+    pub text: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Edit {
@@ -99,6 +114,14 @@ pub struct Edit {
     /// Bildbreite. Umkehrbar wie jeder andere Regler — das Original bleibt heil.
     #[serde(default)]
     pub heal: Vec<[f32; 3]>,
+    /// Wie `heal`, aber die Stelle fuellt das lokale Retusche-Modell aus der
+    /// Umgebung neu (siehe `heal_ki`), statt eine Nachbarstelle zu kopieren.
+    #[serde(default, rename = "healKi")]
+    pub heal_ki: Vec<[f32; 3]>,
+    /// Eingesetzte Dinge (Hinzufuegen mit dem Bildgenerator). Das erzeugte Bild
+    /// liegt als Datei neben dem Foto, hier steht, wo und wie es hingehoert.
+    #[serde(default)]
+    pub zusaetze: Vec<Zusatz>,
     #[serde(rename = "hslH")]
     pub hsl_h: [f32; 8],
     #[serde(rename = "hslS")]
@@ -188,6 +211,8 @@ impl Default for Edit {
             flip_v: false,
             straighten: 0.0,
             heal: Vec::new(),
+            heal_ki: Vec::new(),
+            zusaetze: Vec::new(),
             hsl_h: [0.0; 8],
             hsl_s: [0.0; 8],
             hsl_l: [0.0; 8],

@@ -57,6 +57,8 @@ jobs:
         run: scripts/paket-linux.sh
       - name: Smoke test (software renderer)
         run: scripts/rauchtest.sh dist/Fotowache-*-linux-${{ matrix.arch }}/fotowache
+      - name: Local AI runtimes (download, unpack, start; no models)
+        run: dist/Fotowache-*-linux-${{ matrix.arch }}/fotowache --ki-laufzeit-pruefen
       - uses: actions/upload-artifact@v4
         with:
           name: linux-${{ matrix.arch }}
@@ -97,6 +99,8 @@ jobs:
         run: scripts/paket-macos.sh
       - name: Smoke test
         run: scripts/rauchtest.sh dist/Fotowache.app/Contents/MacOS/Fotowache
+      - name: Local AI runtimes (download, unpack, start; no models)
+        run: dist/Fotowache.app/Contents/MacOS/Fotowache --ki-laufzeit-pruefen
       - uses: actions/upload-artifact@v4
         with:
           name: macos-${{ matrix.arch }}
@@ -149,6 +153,9 @@ jobs:
       - name: Smoke test
         shell: bash
         run: scripts/rauchtest.sh dist/Fotowache-windows/fotowache.exe
+      - name: Local AI runtimes (download, unpack, start; no models)
+        shell: bash
+        run: dist/Fotowache-windows/fotowache.exe --ki-laufzeit-pruefen
       - uses: actions/upload-artifact@v4
         with:
           name: windows-x64

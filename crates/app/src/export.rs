@@ -174,10 +174,32 @@ pub fn save_developed(
     // wurde VOR dem Entwickeln in ganzen Schritten verkleinert: aus „lange Kante
     // 2400" wurden 1938 px, und Schaerfe/Rauschminderung rechneten auf einem
     // anderen Bild als dem, das man in der Vorschau beurteilt hatte.
-    let mut img = GpuImage::upload_mit(gpu, raw, None, &edit.heal)?;
+    let stuecke = crate::zusatz::stuecke(src, &edit.zusaetze);
+    let retusche = pipeline::Retusche { heal: &edit.heal, heal_ki: &edit.heal_ki, zusaetze: &stuecke };
     // Objektivkorrektur auch im Export — Vorschau und Datei muessen dasselbe
     // zeigen. `erkennen` misst zusaetzlich die Randabdunklung am Bild.
-    img.objektiv = pipeline::objektiv::erkennen(raw);
+    let objektiv = pipeline::objektiv::erkennen(raw);
+    // Sehr grosse Bilder (Panoramen, Mittelformat) in Kacheln: eine Kante ueber
+    // 16384 passt in keine Textur, und ein Panorama mit 68 MP sprengte den
+    // Rueckholpuffer (gemessen). `FOTOWACHE_KACHEL=<px>` erzwingt Kacheln —
+    // fuer den Vergleich „ganz gegen gekachelt".
+    let erzwungen = std::env::var("FOTOWACHE_KACHEL").ok().and_then(|v| v.parse::<u32>().ok());
+    let gross = raw.width.max(raw.height) > 16384 || raw.width as u64 * raw.height as u64 > 60_000_000;
+    let kachel = erzwungen.or(gross.then_some(pipeline::KACHEL_KANTE));
+    let sechzehn = settings.format == Format::Tiff16;
+    let gerendert = match kachel {
+        Some(k) => GpuImage::kachelweise(gpu, raw, &retusche, edit, objektiv, k, sechzehn)?,
+        None => {
+            let mut img = GpuImage::upload_mit(gpu, raw, None, &retusche)?;
+            img.objektiv = objektiv;
+            let (w, h) = (img.width, img.height);
+            if sechzehn {
+                pipeline::Gerendert::Rgb16 { w, h, px: img.render16(gpu, edit) }
+            } else {
+                pipeline::Gerendert::Rgba8 { w, h, px: img.render(gpu, edit) }
+            }
+        }
+    };
     let target = settings.target_for(src);
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent).map_err(|e| ExportError::Write(e.to_string()))?;
@@ -189,20 +211,20 @@ pub fn save_developed(
 
     // 16-Bit-Weg getrennt: hier wird die 8-Bit-Stufe komplett uebersprungen,
     // die sonst jede Tonwertabstufung kostet.
-    if settings.format == Format::Tiff16 {
-        let rgb16 = img.render16(gpu, edit);
-        let (rgb16, cw, ch) = ausrichten_und_schneiden_rgb16(&rgb16, img.width, img.height, edit);
-        let (rgb16, cw, ch) = verkleinern16(rgb16, cw, ch, settings.max_dim);
-        let datei = pipeline::exif::tiff16(&rgb16, cw, ch, &auf, &icc);
-        std::fs::write(&target, &datei).map_err(|e| ExportError::Write(e.to_string()))?;
-        return Ok(target);
-    }
-
-    let rgba = img.render(gpu, edit);
+    let (rgba, w, h) = match gerendert {
+        pipeline::Gerendert::Rgb16 { w, h, px } => {
+            let (rgb16, cw, ch) = ausrichten_und_schneiden_rgb16(&px, w, h, edit);
+            let (rgb16, cw, ch) = verkleinern16(rgb16, cw, ch, settings.max_dim);
+            let datei = pipeline::exif::tiff16(&rgb16, cw, ch, &auf, &icc);
+            std::fs::write(&target, &datei).map_err(|e| ExportError::Write(e.to_string()))?;
+            return Ok(target);
+        }
+        pipeline::Gerendert::Rgba8 { w, h, px } => (px, w, h),
+    };
 
     // Zuschnitt zuletzt: die Regler haben auf dem ganzen Bild gerechnet, damit
     // Histogramm-abhaengige Schritte nicht davon abhaengen, wo gerade geschnitten ist.
-    let (rgba, cw, ch) = ausrichten_und_schneiden_rgba(&rgba, img.width, img.height, edit);
+    let (rgba, cw, ch) = ausrichten_und_schneiden_rgba(&rgba, w, h, edit);
     let buf = image::RgbaImage::from_raw(cw, ch, rgba)
         .ok_or_else(|| ExportError::Write(t("Puffergröße passt nicht").into()))?;
     let buf = verkleinern8(buf, settings.max_dim);

@@ -7,7 +7,7 @@ members = ["crates/rawcore", "crates/pipeline", "crates/app"]
 # Fusszeile und die Info.plist des Programmpakets lesen alle von hier.
 # (Die Info.plist trug schon einmal still eine andere Nummer als Cargo —
 # genau die Drift, die in einem anderen Projekt einen Update-Loop ausloeste.)
-version = "2.0.0"
+version = "2.1.0"
 edition = "2021"
 rust-version = "1.85"
 

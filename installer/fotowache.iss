@@ -52,3 +52,11 @@ Name: "{autodesktop}\Fotowache"; Filename: "{app}\fotowache.exe"; Tasks: desktop
 
 [Run]
 Filename: "{app}\fotowache.exe"; Description: "{cm:LaunchProgram,Fotowache}"; Flags: nowait postinstall skipifsilent
+; Nach einem Update aus Fotowache heraus (still, /STARTEN=1) wieder starten.
+Filename: "{app}\fotowache.exe"; Flags: nowait; Check: NachUpdateStarten
+
+[Code]
+function NachUpdateStarten(): Boolean;
+begin
+  Result := ExpandConstant('{param:STARTEN|0}') = '1';
+end;

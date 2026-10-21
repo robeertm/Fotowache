@@ -2,6 +2,62 @@
 
 All notable changes to Fotowache. Versions follow [Semantic Versioning](https://semver.org/).
 
+## [2.1.0] - 2026-10-21
+
+### Local AI
+- New optional **local AI**, installed with one click (about 3.3 GB, pinned
+  versions, SHA-256 verified, resumable). It runs entirely on the computer; the
+  previous server-based AI is gone.
+- **Develop with AI:** the AI describes and classifies the photo (scene, light,
+  people, sky, haze, colour cast, suitable look); Fotowache turns that into
+  slider changes on top of the automatic settings, checks brightness by
+  rendering the result, and keeps all guard rails. Strength gentle / normal /
+  strong, AI log with what was seen and changed.
+- **AI fill** for the object removal brush: removes large objects by
+  recreating the area from its surroundings.
+- **Add:** paint an area and describe what should appear (e.g. clouds); the new
+  content is placed into the raw data and follows all sliders.
+- **Image generator** (bonus, separate download of about 5.2 GB): create images
+  from a description, locally.
+- Command line: `--ki-installieren`, `--ki-entfernen`, `--ki` (batch with AI),
+  `--hinzufuegen`, `--bild`, `--generator-installieren`, `--ki-laufzeit-pruefen`,
+  `--ohne-automatik` (all sliders at zero).
+
+### Panorama
+- New **Panorama…** for two or more selected photos: overlaps are found
+  automatically in any order, photos that do not fit are left out with a
+  reason, all photos are aligned together (bundle adjustment) with estimated
+  focal length and lens distortion, brightness is matched, seams are placed
+  where the photos agree and blended across several frequency bands.
+- Lens distortion, colour fringing and vignetting are corrected from the
+  camera's or the database's lens profile before stitching; the panorama keeps
+  the capture date.
+- Projections cylinder, sphere and flat.
+- Empty edges are either cropped to the largest fully covered rectangle (as an
+  editable crop) or filled by the local AI.
+- The panorama is saved as a linear DNG next to the photos and is developed
+  like any other raw file.
+- Command line: `--panorama <files…>` with `--projektion`, `--raender-fuellen`,
+  `--ohne-zuschnitt`, `--voll`.
+
+### Updates
+- Fotowache looks for a newer release at start and offers it with one button;
+  the update is checked against the release checksums and installed in place
+  (app bundle, setup, AppImage or command-line install), then Fotowache
+  restarts. `FOTOWACHE_KEINE_UPDATES=1` turns the check off; command line
+  `--update`.
+
+### Fixes
+- The status bar no longer shows a stray separator for files without a camera
+  name.
+- Very large images (panoramas, medium format above about 60 megapixels or
+  wider than 16384 pixels) no longer crash the export: they are developed in
+  tiles that share the whole image's tone base and noise level, so the result
+  matches a single-piece development.
+- Two developments of the same photo could differ in thin rows by a few
+  levels; the development and output stages now run strictly one after the
+  other.
+
 ## [2.0.0] - 2026-10-20
 
 First public release.

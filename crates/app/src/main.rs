@@ -16,11 +16,16 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 mod ai;
+mod generator;
+mod ki_lokal;
 mod export;
 mod grundpanel;
 mod ordner;
+mod panorama;
 mod presets;
 mod sprache;
+mod updater;
+mod zusatz;
 
 use eframe::egui;
 use pipeline::{params::Edit, Gpu, GpuImage};
@@ -35,18 +40,6 @@ use std::sync::Arc;
 const PREVIEW_MAX: u32 = 2400;
 const THUMB_MAX: u32 = 320;
 
-/// Der KI-Server fuer „Magisch entwickeln" (`/api/ai/develop`, wie in der
-/// Web-Version). Zur Laufzeit gilt die Umgebungsvariable `FOTOWACHE_KI`, sonst der
-/// beim Bauen mitgegebene `FOTOWACHE_KI_STANDARD` — eine Adresse gehoert nicht in
-/// den Quelltext. Leer heisst: keine KI; die Bedienelemente bleiben dann weg,
-/// statt Fehler zu zeigen. `FOTOWACHE_KI=` (leer) schaltet sie auch ab.
-fn ki_endpunkt() -> String {
-    std::env::var("FOTOWACHE_KI")
-        .unwrap_or_else(|_| option_env!("FOTOWACHE_KI_STANDARD").unwrap_or("").to_string())
-        .trim()
-        .to_string()
-}
-
 fn main() -> eframe::Result<()> {
     // Stapel ohne Fenster: `fotowache --stapel <ordner|dateien…> [--ziel <ordner>]`.
     // Praktisch fuer grosse Mengen ueber Nacht — und der Weg, auf dem sich die
@@ -54,6 +47,8 @@ fn main() -> eframe::Result<()> {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     // Ordner aus der Zeit vor dem Namen „Fotowache" mitnehmen (einmalig).
     ordner::umziehen();
+    // Retusche-Modell der lokalen KI bekannt machen (falls installiert).
+    pipeline::heal_ki::modell_setzen(ki_lokal::retusche_modell());
     #[cfg(windows)]
     if argv.first().is_some_and(|a| a.starts_with("--")) {
         konsole_anhaengen();
@@ -65,7 +60,275 @@ fn main() -> eframe::Result<()> {
         std::process::exit(0);
     }
     if argv.first().map(|a| a == "--stapel").unwrap_or(false) {
-        std::process::exit(run_batch_cli(&argv[1..]));
+        let code = run_batch_cli(&argv[1..]);
+        ki_lokal::beenden();
+        std::process::exit(code);
+    }
+    // Lokale KI ohne Fenster installieren / entfernen.
+    if argv.first().map(|a| a == "--ki-installieren").unwrap_or(false) {
+        if ki_lokal::installiert() {
+            println!("{}", t("Lokale KI ist installiert."));
+            std::process::exit(0);
+        }
+        let abbruch = std::sync::atomic::AtomicBool::new(false);
+        let zuletzt = std::cell::Cell::new(0u64);
+        let ergebnis = ki_lokal::installieren(
+            &|f| match f {
+                ki_lokal::Fortschritt::Laedt { datei, von, bytes, gesamt } => {
+                    // Hoechstens alle 100 MB eine Zeile.
+                    if bytes / 100_000_000 != zuletzt.get() || bytes == gesamt {
+                        zuletzt.set(bytes / 100_000_000);
+                        println!("[{datei}/{von}] {:.0} / {:.0} MB", bytes as f64 / 1e6, gesamt as f64 / 1e6);
+                    }
+                }
+                ki_lokal::Fortschritt::Entpackt => println!("{}", t("KI wird eingerichtet…")),
+                ki_lokal::Fortschritt::Fertig => println!("{}", t("Lokale KI ist installiert.")),
+            },
+            &abbruch,
+        );
+        if let Err(e) = ergebnis {
+            eprintln!("{}", tf("KI-Installation: {}", &[&e]));
+            std::process::exit(1);
+        }
+        std::process::exit(0);
+    }
+    // Bildgenerator ohne Fenster: installieren und ein Bild erzeugen.
+    if argv.first().map(|a| a == "--generator-installieren").unwrap_or(false) {
+        let abbruch = std::sync::atomic::AtomicBool::new(false);
+        let zuletzt = std::cell::Cell::new(0u64);
+        let r = generator::installieren(
+            &|f| {
+                if let ki_lokal::Fortschritt::Laedt { datei, von, bytes, gesamt } = f {
+                    if bytes / 100_000_000 != zuletzt.get() || bytes == gesamt {
+                        zuletzt.set(bytes / 100_000_000);
+                        println!("[{datei}/{von}] {:.0} / {:.0} MB", bytes as f64 / 1e6, gesamt as f64 / 1e6);
+                    }
+                }
+            },
+            &abbruch,
+        );
+        match r {
+            Ok(()) => println!("{}", t("Bildgenerator ist installiert.")),
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        }
+        std::process::exit(0);
+    }
+    if argv.first().map(|a| a == "--bild").unwrap_or(false) {
+        // fotowache --bild "<Beschreibung>" --ziel bild.png [--format quer|hoch|quadrat] [--seed n]
+        let mut text = None;
+        let mut ziel = PathBuf::from("bild.png");
+        let mut format = generator::Format::Quer;
+        let mut seed = 1u64;
+        let mut it = argv[1..].iter();
+        while let Some(a) = it.next() {
+            match a.as_str() {
+                "--ziel" => ziel = it.next().map(PathBuf::from).unwrap_or(ziel),
+                "--format" => {
+                    format = match it.next().map(String::as_str) {
+                        Some("hoch") => generator::Format::Hoch,
+                        Some("quadrat") | Some("quadratisch") => generator::Format::Quadrat,
+                        _ => generator::Format::Quer,
+                    }
+                }
+                "--seed" => seed = it.next().and_then(|s| s.parse().ok()).unwrap_or(seed),
+                other => text = Some(other.to_string()),
+            }
+        }
+        let Some(text) = text else {
+            eprintln!("fotowache --bild \"<…>\" --ziel bild.png [--format quer|hoch|quadrat] [--seed n]");
+            std::process::exit(2);
+        };
+        let beginn = std::time::Instant::now();
+        match generator::erzeugen(&text, format, seed, &ziel) {
+            Ok(()) => println!("{} ({:.0} s)", ziel.display(), beginn.elapsed().as_secs_f32()),
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        }
+        std::process::exit(0);
+    }
+    // Bauablauf: laufen die KI-Laufzeiten auf diesem System? (ohne Modelle)
+    if argv.first().map(|a| a == "--ki-laufzeit-pruefen").unwrap_or(false) {
+        let basis = std::env::temp_dir().join(format!("fotowache-laufzeit-{}", std::process::id()));
+        let mut fehler = false;
+        let pruefe = |name: &str, verfuegbar: Result<(), String>, lz: Option<ki_lokal::Datei>, programm: &str| -> bool {
+            match (verfuegbar, lz) {
+                (Err(grund), _) => {
+                    println!("{name}: nicht verfügbar — {grund}");
+                    true
+                }
+                (Ok(()), Some(lz)) => match ki_lokal::laufzeit_pruefen(&lz, &basis.join(name), programm) {
+                    Ok(v) => {
+                        println!("{name}: OK — {v}");
+                        true
+                    }
+                    Err(e) => {
+                        eprintln!("{name}: FEHLER — {e}");
+                        false
+                    }
+                },
+                (Ok(()), None) => true,
+            }
+        };
+        let server = if cfg!(windows) { "llama-server.exe" } else { "llama-server" }; // Kennung: Programmname der Laufzeit
+        let cli = if cfg!(windows) { "sd-cli.exe" } else { "sd-cli" }; // Kennung: Programmname der Laufzeit
+        fehler |= !pruefe("ki", ki_lokal::verfuegbar(), ki_lokal::laufzeit(), server);
+        fehler |= !pruefe("generator", generator::verfuegbar(), generator::laufzeit(), cli);
+        let _ = std::fs::remove_dir_all(&basis);
+        std::process::exit(if fehler { 1 } else { 0 });
+    }
+    // Hinzufuegen ohne Fenster (Pruefstand): fotowache --hinzufuegen <raw>
+    // --text "…" --bereich x0,y0,x1,y1  — markiert den Bereich, setzt ein und
+    // legt das Ergebnis in die Begleitdatei (exportieren dann mit --stapel).
+    if argv.first().map(|a| a == "--hinzufuegen").unwrap_or(false) {
+        let (mut raw_pfad, mut text, mut bereich) = (None, None, None);
+        let mut it = argv[1..].iter();
+        while let Some(a) = it.next() {
+            match a.as_str() {
+                "--text" => text = it.next().cloned(),
+                "--bereich" => {
+                    bereich = it.next().and_then(|b| {
+                        let v: Vec<f32> = b.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+                        (v.len() == 4).then(|| [v[0], v[1], v[2], v[3]])
+                    })
+                }
+                other => raw_pfad = Some(PathBuf::from(other)),
+            }
+        }
+        let (Some(raw_pfad), Some(text), Some([x0, y0, x1, y1])) = (raw_pfad, text, bereich) else {
+            eprintln!("fotowache --hinzufuegen <raw> --text \"…\" --bereich x0,y0,x1,y1");
+            std::process::exit(2);
+        };
+        let raw = match rawcore::decode(&raw_pfad, &rawcore::DecodeOptions::default()) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        };
+        let grund = grundstand(&raw_pfad, &raw);
+        let mut edit = load_sidecar(&raw_pfad).map(|(e, _)| e).unwrap_or_else(|| grund.clone());
+        startwerte_nachziehen(&mut edit, &grund);
+        // Den Bereich mit Flecken fuellen (Radius 4 % der Breite, dicht gesetzt).
+        let r = 0.04f32;
+        let seiten = raw.height as f32 / raw.width as f32;
+        let mut flecken = Vec::new();
+        let mut y = y0 + r / seiten;
+        while y <= y1 - r / seiten + 1e-6 {
+            let mut x = x0 + r;
+            while x <= x1 - r + 1e-6 {
+                flecken.push([x, y, r]);
+                x += r;
+            }
+            y += r / seiten;
+        }
+        let beginn = std::time::Instant::now();
+        match zusatz::erzeugen(&raw, &raw_pfad, &edit, flecken, &text, 7) {
+            Ok(z) => {
+                println!("{} ({:.0} s)", z.datei, beginn.elapsed().as_secs_f32());
+                edit.zusaetze.push(z);
+                edit.bearbeitet = true;
+                let stars = load_sidecar(&raw_pfad).map(|(_, s)| s).unwrap_or(0);
+                save_sidecar(&raw_pfad, &edit, stars);
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        }
+        std::process::exit(0);
+    }
+    // Panorama ohne Fenster: fotowache --panorama <fotos…> [--projektion zylinder|kugel|eben]
+    // [--raender-fuellen] [--ohne-zuschnitt] [--ohne-parallaxe] [--voll]
+    if argv.first().map(|a| a == "--panorama").unwrap_or(false) {
+        let mut auftrag = panorama::Auftrag {
+            dateien: Vec::new(),
+            projektion: pipeline::panorama::Projektion::Zylinder,
+            belichtung_angleichen: true,
+            parallaxe_ausgleichen: true,
+            raender_fuellen: false,
+            zuschneiden: true,
+            max_seite: 8000,
+        };
+        let mut it = argv[1..].iter();
+        while let Some(a) = it.next() {
+            match a.as_str() {
+                "--projektion" => {
+                    auftrag.projektion = match it.next().map(String::as_str) {
+                        Some("kugel") => pipeline::panorama::Projektion::Kugel,
+                        Some("eben") => pipeline::panorama::Projektion::Eben,
+                        _ => pipeline::panorama::Projektion::Zylinder,
+                    }
+                }
+                "--raender-fuellen" => auftrag.raender_fuellen = true,
+                "--ohne-zuschnitt" => auftrag.zuschneiden = false,
+                "--ohne-parallaxe" => auftrag.parallaxe_ausgleichen = false,
+                "--voll" => auftrag.max_seite = 0,
+                other => auftrag.dateien.push(PathBuf::from(other)),
+            }
+        }
+        let beginn = std::time::Instant::now();
+        let letzte = std::cell::Cell::new(-1i32);
+        match panorama::erstellen(&auftrag, &|a, text| {
+            let p = (a * 100.0) as i32;
+            if p / 5 != letzte.get() / 5 {
+                letzte.set(p);
+                println!("{p:3} %  {text}");
+            }
+        }) {
+            Ok(p) => println!("{} ({:.0} s)", p.display(), beginn.elapsed().as_secs_f32()),
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        }
+        std::process::exit(0);
+    }
+    // Update ohne Fenster: pruefen und installieren (ohne Neustart).
+    if argv.first().map(|a| a == "--update").unwrap_or(false) {
+        match updater::pruefen() {
+            Ok(None) => {
+                println!("{}", if updater::art().is_some() { t("Fotowache ist aktuell.") } else { t("Diese Kopie wird nicht automatisch aktualisiert.") });
+            }
+            Ok(Some(neu)) => {
+                println!("{}", tf("Neue Version {} — wird geladen …", &[&neu.version]));
+                let abbruch = std::sync::atomic::AtomicBool::new(false);
+                if let Err(e) = updater::installieren(&neu, &|_, _| {}, &abbruch) {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                }
+                println!("{}", tf("Aktualisiert auf {}.", &[&neu.version]));
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        }
+        std::process::exit(0);
+    }
+    if argv.first().map(|a| a == "--generator-entfernen").unwrap_or(false) {
+        match generator::entfernen() {
+            Ok(()) => println!("{}", t("Bildgenerator entfernt.")),
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        }
+        std::process::exit(0);
+    }
+    if argv.first().map(|a| a == "--ki-entfernen").unwrap_or(false) {
+        match ki_lokal::entfernen() {
+            Ok(()) => println!("{}", t("Lokale KI entfernt.")),
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        }
+        std::process::exit(0);
     }
     // Miniatur ohne Fenster: `fotowache --miniatur <raw> <ziel.png>` — derselbe Weg,
     // den Galerie und Filmstreifen nehmen. Nur so laesst sich deren Helligkeit
@@ -129,6 +392,7 @@ fn run_batch_cli(args: &[String]) -> i32 {
     let mut inputs: Vec<PathBuf> = Vec::new();
     let mut settings = export::ExportSettings::default();
     let mut use_ai = false;
+    let mut ohne_automatik = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -145,16 +409,18 @@ fn run_batch_cli(args: &[String]) -> i32 {
             "--tiff" => settings.format = export::Format::Tiff16,
             "--png" => settings.format = export::Format::Png,
             "--ki" => use_ai = true,
+            // Alle Regler auf null — das unbearbeitete Foto (Vergleiche, Pruefstand).
+            "--ohne-automatik" => ohne_automatik = true,
             other => inputs.push(PathBuf::from(other)),
         }
     }
-    // Ohne KI-Server waere `--ki` still wirkungslos — lieber gleich sagen, was fehlt.
-    let endpoint = ki_endpunkt();
-    if use_ai && endpoint.is_empty() {
+    // Ohne installierte lokale KI waere `--ki` still wirkungslos — lieber gleich
+    // sagen, was fehlt.
+    if use_ai && !ki_lokal::installiert() {
         eprintln!(
             "{}",
-            t("Kein KI-Server eingestellt: --ki braucht die Umgebungsvariable FOTOWACHE_KI \
-               mit der Adresse des Servers (z. B. FOTOWACHE_KI=http://server:port).")
+            t("Die lokale KI ist nicht installiert: erst `fotowache --ki-installieren` \
+               (einmalig, lädt die Modelle herunter).")
         );
         return 2;
     }
@@ -190,7 +456,15 @@ fn run_batch_cli(args: &[String]) -> i32 {
     for (i, f) in files.iter().enumerate() {
         let beginn = std::time::Instant::now();
         let result = if use_ai {
-            develop_with_ai(&gpu, f, &presets::start_edit(), &settings, &endpoint, ai::Strength::Normal)
+            develop_with_ai(&gpu, f, &presets::start_edit(), &settings, ai::Strength::Normal)
+        } else if ohne_automatik {
+            rawcore::decode(f, &rawcore::DecodeOptions::default())
+                .map_err(export::ExportError::from)
+                .and_then(|raw| {
+                    let mut e = presets::start_edit();
+                    e.rotate = drehung_aus_kamera(raw.meta.flip);
+                    export::save_developed(&gpu, &raw, f, &e, &settings)
+                })
         } else {
             // Bereits gesicherte Bearbeitung hat Vorrang; sonst Startwerte MIT
             // gemessener Grundhelligkeit. Fehlt einer Begleitdatei die
@@ -402,18 +676,26 @@ enum Msg {
         rgba: Vec<u8>,
     },
     Batch(export::BatchMsg),
+    /// Fortschritt der KI-Installation (Text, Anteil 0..1).
+    KiFortschritt(String, f32),
+    /// Installation beendet (Fehlertext oder Erfolg).
+    KiInstalliert(Result<(), String>),
+    GenFortschritt(String, f32),
+    GenInstalliert(Result<(), String>),
+    /// Ein erzeugtes Bild liegt bereit (Pfad der PNG-Datei).
+    GenFertig(Result<PathBuf, String>),
+    /// Panorama: Fortschritt (Anteil, Text) / fertig.
+    PanoFortschritt(f32, String),
+    PanoFertig(Result<PathBuf, String>),
+    /// Updater: neuere Version gefunden / Ladefortschritt / fertig installiert.
+    UpdateGefunden(updater::Neu),
+    UpdateFortschritt(u64, u64),
+    UpdateFertig(Result<std::process::Command, String>),
+    /// Ein eingesetztes Stueck (Hinzufuegen) ist fertig.
+    ZusatzFertig { path: PathBuf, ergebnis: Result<pipeline::params::Zusatz, String> },
     Ai {
         path: PathBuf,
         result: Box<Result<ai::AiResult, String>>,
-    },
-    /// Zwischenstand, waehrend die KI noch arbeitet: nach JEDEM Durchgang
-    /// werden Bild und Regler sofort nachgezogen. Vorher kam erst nach der
-    /// letzten Nachkontrolle eine einzige Nachricht — der erste Durchgang
-    /// blieb unsichtbar und es sah aus, als taete die KI nichts.
-    AiZwischen {
-        path: PathBuf,
-        edit: Edit,
-        hinweis: String,
     },
     /// Eine Zeile fuers KI-Protokoll, waehrend die Arbeit noch laeuft.
     Protokoll(LogZeile),
@@ -538,7 +820,47 @@ struct App {
     decode_naechster: Option<PathBuf>,
 
     /// Adresse des KI-Servers; leer = keine KI (siehe `ki_endpunkt`).
-    ai_endpoint: String,
+    /// Lokale KI installiert? (Knopf „Magisch entwickeln" statt „installieren")
+    ki_installiert: bool,
+    /// Laufende Installation: Fortschrittstext und Anteil.
+    ki_laedt: Option<(String, f32)>,
+    ki_abbruch: Arc<std::sync::atomic::AtomicBool>,
+    /// Neue Retusche-Stellen fuellt die KI (sonst klassisch kopieren).
+    heal_ki_modus: bool,
+    /// Panorama: Fenster, Optionen, laufender Auftrag, Ergebnis.
+    pano_fenster: bool,
+    pano_projektion: pipeline::panorama::Projektion,
+    pano_belichtung: bool,
+    pano_parallaxe: bool,
+    pano_fuellen: bool,
+    pano_zuschneiden: bool,
+    pano_volle_aufloesung: bool,
+    pano_laeuft: Option<(f32, String)>,
+    pano_ergebnis: Option<PathBuf>,
+    pano_meldung: String,
+    /// Updater: gefundene neuere Version, laufender Download, Meldung.
+    update_neu: Option<updater::Neu>,
+    update_laedt: Option<(u64, u64)>,
+    update_meldung: String,
+    update_geprueft: bool,
+    update_abbruch: Arc<std::sync::atomic::AtomicBool>,
+    /// Hinzufuegen: Pinsel markiert den Bereich, der Generator setzt ein.
+    hinzufuegen_modus: bool,
+    zusatz_flecken: Vec<[f32; 3]>,
+    zusatz_text: String,
+    zusatz_seit: Option<std::time::Instant>,
+    zusatz_meldung: String,
+    /// Bildgenerator (Bonus): Fenster, Installation, Auftrag, Ergebnis.
+    gen_fenster: bool,
+    gen_installiert: bool,
+    gen_laedt: Option<(String, f32)>,
+    gen_abbruch: Arc<std::sync::atomic::AtomicBool>,
+    gen_text: String,
+    gen_format: generator::Format,
+    gen_seed: u64,
+    gen_seit: Option<std::time::Instant>,
+    gen_ergebnis: Option<(PathBuf, egui::TextureHandle)>,
+    gen_meldung: String,
     ai_strength: ai::Strength,
     ai_busy: bool,
     ai_note: String,
@@ -547,7 +869,6 @@ struct App {
     /// den aktuellen Stand fortlaufend ueberschreiben.
     ai_undo: Option<Edit>,
     /// Wie oft die KI ihr eigenes Ergebnis nachkontrolliert (0–2), wie im Web.
-    ai_rounds: u8,
     /// Das mitlaufende KI-Protokoll und ob es gerade zu sehen ist.
     ai_log: Vec<LogZeile>,
     show_log: bool,
@@ -643,12 +964,44 @@ impl App {
             // ⚠️ Die Adresse als IP angeben, nicht als lokalen Rechnernamen: den
             // loest zwar curl (ueber mDNS/Bonjour) auf, Rusts Namensaufloesung aber
             // nicht — die KI wuerde sonst still uebersprungen.
-            ai_endpoint: ki_endpunkt(),
+            ki_installiert: ki_lokal::installiert(),
+            ki_laedt: None,
+            ki_abbruch: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            heal_ki_modus: ki_lokal::retusche_modell().is_some(),
+            pano_fenster: false,
+            pano_projektion: pipeline::panorama::Projektion::Zylinder,
+            pano_belichtung: true,
+            pano_parallaxe: true,
+            pano_fuellen: false,
+            pano_zuschneiden: true,
+            pano_volle_aufloesung: false,
+            pano_laeuft: None,
+            pano_ergebnis: None,
+            pano_meldung: String::new(),
+            update_neu: None,
+            update_laedt: None,
+            update_meldung: String::new(),
+            update_geprueft: false,
+            update_abbruch: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            hinzufuegen_modus: false,
+            zusatz_flecken: Vec::new(),
+            zusatz_text: String::new(),
+            zusatz_seit: None,
+            zusatz_meldung: String::new(),
+            gen_fenster: false,
+            gen_installiert: generator::installiert(),
+            gen_laedt: None,
+            gen_abbruch: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            gen_text: String::new(),
+            gen_format: generator::Format::Quer,
+            gen_seed: 1,
+            gen_seit: None,
+            gen_ergebnis: None,
+            gen_meldung: String::new(),
             ai_strength: ai::Strength::Normal,
             ai_busy: false,
             ai_note: String::new(),
             ai_undo: None,
-            ai_rounds: 1,
             ai_log: Vec::new(),
             show_log: false,
             show_before: false,
@@ -810,10 +1163,10 @@ impl App {
         let tx = self.tx.clone();
         // Bereits gesicherte Retuschestellen kennt der Haupt-Thread — mitgeben,
         // damit der Lade-Thread die Arbeitskopie fertig aufbauen kann.
-        let heal = self
+        let (heal, heal_ki, zusaetze) = self
             .edits
             .get(&path)
-            .map(|e| e.heal.clone())
+            .map(|e| (e.heal.clone(), e.heal_ki.clone(), e.zusaetze.clone()))
             .unwrap_or_default();
         std::thread::spawn(move || {
             match rawcore::decode(&path, &rawcore::DecodeOptions::default()) {
@@ -821,7 +1174,9 @@ impl App {
                     // Alles Teure passiert HIER, nicht auf dem UI-Thread:
                     // Verkleinern (40 MP!), Retusche einrechnen, Belichtung messen,
                     // Objektiv erkennen (mit Vignette-Messung am Bild).
-                    let klein = GpuImage::vorbereiten(&raw, Some(PREVIEW_MAX), &heal);
+                    let stuecke = zusatz::stuecke(&path, &zusaetze);
+                    let retusche = pipeline::Retusche { heal: &heal, heal_ki: &heal_ki, zusaetze: &stuecke };
+                    let klein = GpuImage::vorbereiten(&raw, Some(PREVIEW_MAX), &retusche);
                     let start = grundstand(&path, &raw);
                     let objektiv = pipeline::objektiv::erkennen(&raw);
                     match klein {
@@ -1049,12 +1404,89 @@ impl App {
                 }
                 Msg::Batch(b) => self.on_batch(b),
                 Msg::Protokoll(z) => self.ai_log.push(z),
-                Msg::AiZwischen { path, mut edit, hinweis } => {
-                    self.ai_note = hinweis;
-                    edit.bearbeitet = true;
-                    self.edits.insert(path, edit);
-                    self.needs_render = true;
-                    self.mark_dirty();
+                Msg::KiFortschritt(text, anteil) => self.ki_laedt = Some((text, anteil)),
+                Msg::GenFortschritt(text, anteil) => self.gen_laedt = Some((text, anteil)),
+                Msg::UpdateGefunden(neu) => self.update_neu = Some(neu),
+                Msg::PanoFortschritt(anteil, text) => self.pano_laeuft = Some((anteil, text)),
+                Msg::PanoFertig(ergebnis) => {
+                    let bericht = self.pano_laeuft.take().map(|(_, t)| t).unwrap_or_default();
+                    match ergebnis {
+                        Ok(p) => {
+                            self.pano_meldung = bericht;
+                            self.pano_ergebnis = Some(p);
+                        }
+                        Err(e) => self.pano_meldung = e,
+                    }
+                }
+                Msg::UpdateFortschritt(b, g) => self.update_laedt = Some((b, g)),
+                Msg::UpdateFertig(ergebnis) => {
+                    self.update_laedt = None;
+                    match ergebnis {
+                        Ok(mut start) => {
+                            // Bearbeitung sichern, KI-Dienst beenden, neue Fassung
+                            // starten, diese beenden.
+                            self.save_current_sidecar();
+                            ki_lokal::beenden();
+                            match start.spawn() {
+                                Ok(_) => std::process::exit(0),
+                                Err(e) => self.update_meldung = tf("Neustart: {}", &[&e]),
+                            }
+                        }
+                        Err(e) => self.update_meldung = tf("Update: {}", &[&e]),
+                    }
+                }
+                Msg::ZusatzFertig { path, ergebnis } => {
+                    self.zusatz_seit = None;
+                    match ergebnis {
+                        Ok(z) => {
+                            if self.current_path().as_ref() == Some(&path) {
+                                self.push_undo();
+                            }
+                            let mut e = self.edits.get(&path).cloned().unwrap_or_else(|| self.edit_ref());
+                            e.zusaetze.push(z);
+                            e.bearbeitet = true;
+                            self.edits.insert(path, e);
+                            self.zusatz_flecken.clear();
+                            self.zusatz_meldung = t("Eingesetzt.").into();
+                            self.needs_reupload = true;
+                            self.mark_dirty();
+                        }
+                        Err(e) => self.zusatz_meldung = e,
+                    }
+                }
+                Msg::GenInstalliert(ergebnis) => {
+                    self.gen_laedt = None;
+                    match ergebnis {
+                        Ok(()) => self.gen_installiert = true,
+                        Err(e) => self.gen_meldung = tf("Installation: {}", &[&e]),
+                    }
+                }
+                Msg::GenFertig(ergebnis) => {
+                    self.gen_seit = None;
+                    match ergebnis.and_then(|p| {
+                        let img = image::open(&p).map_err(|e| e.to_string())?.to_rgba8();
+                        let (w, h) = img.dimensions();
+                        let farbbild = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], img.as_raw());
+                        Ok((p, farbbild))
+                    }) {
+                        Ok((p, farbbild)) => {
+                            let tex = ctx.load_texture("generator", farbbild, egui::TextureOptions::LINEAR);
+                            self.gen_ergebnis = Some((p, tex));
+                            self.gen_meldung.clear();
+                        }
+                        Err(e) => self.gen_meldung = e,
+                    }
+                }
+                Msg::KiInstalliert(ergebnis) => {
+                    self.ki_laedt = None;
+                    match ergebnis {
+                        Ok(()) => {
+                            self.ki_installiert = true;
+                            self.heal_ki_modus = true;
+                            self.status = t("Lokale KI ist installiert.").into();
+                        }
+                        Err(e) => self.status = tf("KI-Installation: {}", &[&e]),
+                    }
                 }
                 Msg::Ai { path, result } => {
                     self.ai_busy = false;
@@ -1080,7 +1512,7 @@ impl App {
                         }
                         Err(e) => {
                             self.ai_undo = None;
-                            self.ai_note = tf("KI nicht erreichbar: {}", &[&e]);
+                            self.ai_note = e;
                         }
                     }
                 }
@@ -1220,12 +1652,15 @@ impl App {
             self.needs_reupload = false;
             return;
         };
-        let heal = self.edit_ref().heal;
+        let e = self.edit_ref();
+        let (heal, heal_ki, zusaetze) = (e.heal, e.heal_ki, e.zusaetze);
         let tx = self.tx.clone();
         self.needs_reupload = false;
         self.reupload_laeuft = true;
         std::thread::spawn(move || {
-            if let Ok(klein) = GpuImage::vorbereiten(&raw, Some(PREVIEW_MAX), &heal) {
+            let stuecke = zusatz::stuecke(&path, &zusaetze);
+            let retusche = pipeline::Retusche { heal: &heal, heal_ki: &heal_ki, zusaetze: &stuecke };
+            if let Ok(klein) = GpuImage::vorbereiten(&raw, Some(PREVIEW_MAX), &retusche) {
                 let _ = tx.send(Msg::Arbeitskopie { path, klein });
             }
         });
@@ -1312,40 +1747,35 @@ impl App {
         self.dirty_at = Some(std::time::Instant::now());
     }
 
-    /// „Magisch entwickeln" — die KI schaut sich das Bild an und setzt die Regler.
+    /// „Magisch entwickeln" — die lokale KI schaut sich das Foto an und
+    /// entwickelt es passend zur Szene (siehe `ai`).
     ///
-    /// Geschickt wird die **bereits entwickelte Vorschau**, nicht das rohe Bild:
-    /// die KI soll beurteilen, was man auf dem Bildschirm sieht. Verkleinert auf
-    /// 1200 px, das reicht fuer die Beurteilung und spart Zeit.
+    /// Geschickt wird die **bereits entwickelte Vorschau**: die KI soll
+    /// beurteilen, was man auf dem Bildschirm sieht.
     fn start_ai(&mut self) {
         let (Some(gpu), Some(img), Some(path)) = (&self.gpu, &self.image, self.current_path())
         else {
             return;
         };
-        // Ohne KI-Server gibt es keinen Knopf — und auch sonst keinen Weg hierher.
-        if self.ai_busy || self.ai_endpoint.is_empty() {
+        if self.ai_busy || !self.ki_installiert {
             return;
         }
         let edit = self.edit_ref();
         let rgba = img.render(gpu, &edit);
         let (w, h) = (img.width, img.height);
-        // Das erkannte Objektiv mit in den Thread nehmen: die Nachkontrolle laedt
-        // das Bild FRISCH hoch — ohne diese Uebergabe saehe die KI dort ein
-        // unkorrigiertes Bild (Verzeichnung, dunkle Ecken) und wuerde gegen
-        // Fehler anarbeiten, die es im fertigen Foto gar nicht gibt.
-        let objektiv = img.objektiv;
-        let endpoint = self.ai_endpoint.clone();
         let strength = self.ai_strength;
-        let rounds = self.ai_rounds;
-        let gpu2 = gpu.clone();
-        let raw2 = self.raw_full.clone();
         let tx = self.tx.clone();
         let name = name_of(&path);
+        // Zum Nachmessen eine kleine eigene Arbeitskopie im Thread — mit dem
+        // erkannten Objektiv und der Retusche, wie das Foto auf dem Schirm.
+        let objektiv = img.objektiv;
+        let gpu2 = gpu.clone();
+        let raw2 = self.raw_full.clone();
+        let path_ki = path.clone();
         self.ai_busy = true;
         self.ai_undo = Some(edit.clone());
         self.ai_log.clear();
-        self.show_log = true;
-        self.ai_note = t("KI schaut sich das Foto an…").into();
+        self.ai_note = t("Lokale KI schaut sich das Foto an…").into();
 
         std::thread::spawn(move || {
             let start = std::time::Instant::now();
@@ -1357,144 +1787,41 @@ impl App {
                     detail,
                 }));
             };
-
             melde(
                 LogArt::Info,
-                if rounds == 0 {
-                    tf("{} — ein Durchgang, danach {}× Nachkontrolle", &[&name, &rounds])
-                } else {
-                    tf("{} — erster Durchgang, danach {}× Nachkontrolle", &[&name, &rounds])
-                },
-                tf(
-                    "Ziel: {}\nStärke: {}\nBild: {}×{}, verkleinert auf 1200 px",
-                    &[&endpoint, &strength.label(), &w, &h],
-                ),
+                tf("{} — lokale KI, Stärke {}", &[&name, &strength.label()]),
+                tf("Bild: {}×{}, verkleinert auf 896 px. Nichts verlässt diesen Rechner.", &[&w, &h]),
             );
-
-            let mut result = ai::develop(&endpoint, &rgba, w, h, &edit, strength, false)
-                .map_err(|e| e.to_string());
+            let klein = raw2.as_ref().and_then(|raw| {
+                let stuecke = zusatz::stuecke(&path_ki, &edit.zusaetze);
+                let retusche = pipeline::Retusche { heal: &edit.heal, heal_ki: &edit.heal_ki, zusaetze: &stuecke };
+                let mut k = GpuImage::upload_mit(&gpu2, raw, Some(900), &retusche).ok()?;
+                k.objektiv = objektiv;
+                Some(k)
+            });
+            let probe = |e: &Edit| klein.as_ref().map(|k| (k.render(&gpu2, e), k.width, k.height));
+            let result = ai::develop(&rgba, w, h, &edit, strength, Some(&probe)).map_err(|e| e.to_string());
             match &result {
                 Ok(r) => melde(
                     LogArt::Erfolg,
                     tf(
-                        "Durchgang 1: {} Werte verändert{}",
-                        &[
-                            &r.geaendert.len(),
-                            &if r.scene_label.is_empty() {
-                                String::new()
-                            } else {
-                                format!(" · {} · {}", r.scene_label, r.look)
-                            },
-                        ],
+                        "{} · {}: {} Werte verändert",
+                        &[&r.scene_label, &r.look, &r.geaendert.len()],
                     ),
-                    tf("{}\n\nAntwort im Wortlaut:\n{}", &[&r.geaendert.join("\n"), &r.roh]),
+                    tf(
+                        "{}\n\n{}\n\nAntwort im Wortlaut:\n{}",
+                        &[&r.description, &r.geaendert.join("\n"), &r.roh],
+                    ),
                 ),
-                Err(e) => melde(LogArt::Fehler, tf("Durchgang 1 fehlgeschlagen: {}", &[e]), String::new()),
+                Err(e) => melde(LogArt::Fehler, tf("fehlgeschlagen: {}", &[e]), String::new()),
             }
-
-            // Den ersten Durchgang SOFORT zeigen — sonst sass man vor einem
-            // unveraenderten Bild, waehrend die Nachkontrollen noch liefen, und
-            // erst deren Ende bewegte Bild und Regler auf einen Schlag.
-            if let Ok(r) = &result {
-                let _ = tx.send(Msg::AiZwischen {
-                    path: path.clone(),
-                    edit: r.edit.clone(),
-                    hinweis: if rounds == 0 {
-                        tf("Durchgang 1: {} Regler gesetzt", &[&r.applied.len()])
-                    } else {
-                        tf(
-                            "Durchgang 1 ist im Bild — {} Regler gesetzt, Nachkontrolle läuft…",
-                            &[&r.applied.len()],
-                        )
-                    },
-                });
-            }
-
             if let Ok(r) = &result {
                 if !r.zurechtgerueckt.is_empty() {
                     melde(
                         LogArt::Info,
                         tf("{} Grundeinstellung(en) beibehalten", &[&r.zurechtgerueckt.len()]),
-                        tf(
-                            "Die KI beurteilt ein kleines Vorschaubild und kann Schärfung auf \
-                             Pixelebene dort nicht sehen. Anheben darf sie, senken nicht:\n{}",
-                            &[&r.zurechtgerueckt.join("\n")],
-                        ),
+                        r.zurechtgerueckt.join("\n"),
                     );
-                }
-            }
-
-            // Nachkontrolle: die KI sieht ihr EIGENES Ergebnis und bessert nach.
-            // Dafuer muss neu gerendert werden — mit den alten Pixeln wuerde sie
-            // ihr Werk gar nicht zu sehen bekommen.
-            for runde in 1..=rounds {
-                let Ok(prev) = &result else { break };
-                let Some(raw) = &raw2 else {
-                    melde(
-                        LogArt::Fehler,
-                        t("Nachkontrolle nicht möglich: Foto nicht mehr im Speicher").into(),
-                        String::new(),
-                    );
-                    break;
-                };
-                let Ok(mut small) = GpuImage::upload(&gpu2, raw, Some(1400)) else {
-                    melde(
-                        LogArt::Fehler,
-                        t("Nachkontrolle nicht möglich: Grafikkarte lehnte ab").into(),
-                        String::new(),
-                    );
-                    break;
-                };
-                small.objektiv = objektiv;
-                melde(
-                    LogArt::Info,
-                    tf(
-                        "Nachkontrolle {} von {}: eigenes Ergebnis wird neu gerechnet und erneut vorgelegt",
-                        &[&runde, &rounds],
-                    ),
-                    String::new(),
-                );
-                let px = small.render(&gpu2, &prev.edit);
-                let vorher = prev.edit.clone();
-                match ai::develop(&endpoint, &px, small.width, small.height, &prev.edit, strength, true) {
-                    Ok(next) => {
-                        let diff = ai::unterschiede(&vorher, &next.edit);
-                        melde(
-                            LogArt::Erfolg,
-                            if diff.is_empty() {
-                                tf("Nachkontrolle {}: nichts zu beanstanden", &[&runde])
-                            } else {
-                                tf("Nachkontrolle {}: {} Werte nachgebessert", &[&runde, &diff.len()])
-                            },
-                            tf("{}\n\nAntwort im Wortlaut:\n{}", &[&diff.join("\n"), &next.roh]),
-                        );
-                        // Auch jede Nachbesserung sofort ins Bild und in die
-                        // Regler — nicht erst am Ende des ganzen Laufs.
-                        let _ = tx.send(Msg::AiZwischen {
-                            path: path.clone(),
-                            edit: next.edit.clone(),
-                            hinweis: if diff.is_empty() {
-                                tf("Nachkontrolle {}: nichts zu beanstanden", &[&runde])
-                            } else {
-                                tf(
-                                    "Nachkontrolle {} ist im Bild — {} Werte nachgebessert",
-                                    &[&runde, &diff.len()],
-                                )
-                            },
-                        });
-                        result = Ok(next);
-                    }
-                    // Eine misslungene Nachkontrolle verwirft nichts — aber sie wird
-                    // benannt. Vorher brach die Schleife stumm ab, und es sah aus,
-                    // als liefe die Nachkontrolle ueberhaupt nicht.
-                    Err(e) => {
-                        melde(
-                            LogArt::Fehler,
-                            tf("Nachkontrolle {} fehlgeschlagen: {}", &[&runde, &e]),
-                            t("Das Ergebnis des vorherigen Durchgangs bleibt erhalten.").into(),
-                        );
-                        break;
-                    }
                 }
             }
             melde(
@@ -1506,6 +1833,422 @@ impl App {
                 path,
                 result: Box::new(result),
             });
+        });
+    }
+
+    fn hinzufuegen_fenster(&mut self, ctx: &egui::Context) {
+        egui::Window::new(t("Hinzufügen"))
+            .id(egui::Id::new("Hinzufuegen"))
+            .default_width(420.0)
+            .default_pos(egui::pos2(ctx.content_rect().width() - 760.0, 120.0))
+            .resizable(true)
+            .show(ctx, |ui| {
+                ui.label(t("1. Den Bereich im Foto anmalen, in den etwas hinzukommen soll."));
+                ui.label(t("2. Beschreiben, was dort erscheinen soll:"));
+                ui.add(
+                    egui::TextEdit::multiline(&mut self.zusatz_text)
+                        .desired_rows(2)
+                        .desired_width(f32::INFINITY)
+                        .hint_text(t("z. B. ein paar weiße Wolken am blauen Himmel")),
+                );
+                ui.horizontal(|ui| {
+                    let laeuft = self.zusatz_seit.is_some();
+                    let bereit = !self.zusatz_flecken.is_empty() && !self.zusatz_text.trim().is_empty();
+                    if ui.add_enabled(!laeuft && bereit, egui::Button::new(t("Hinzufügen"))).clicked() {
+                        self.zusatz_starten();
+                    }
+                    if ui
+                        .add_enabled(!laeuft && !self.zusatz_flecken.is_empty(), egui::Button::new(t("Markierung leeren")))
+                        .clicked()
+                    {
+                        self.zusatz_flecken.clear();
+                    }
+                    if let Some(seit) = self.zusatz_seit {
+                        ui.add(egui::Spinner::new());
+                        ui.label(tf("läuft seit {} s (~1,5 min)", &[&seit.elapsed().as_secs()]));
+                        ctx.request_repaint_after(std::time::Duration::from_millis(500));
+                    }
+                });
+                if !self.zusatz_meldung.is_empty() {
+                    ui.label(egui::RichText::new(&self.zusatz_meldung).size(11.0));
+                }
+                let zusaetze = self.edit_ref().zusaetze;
+                if !zusaetze.is_empty() {
+                    ui.separator();
+                    let mut weg = None;
+                    for (i, z) in zusaetze.iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            if ui.small_button("✕").on_hover_text(t("Wieder entfernen")).clicked() {
+                                weg = Some(i);
+                            }
+                            ui.label(&z.text);
+                        });
+                    }
+                    if let Some(i) = weg {
+                        self.push_undo();
+                        self.edit().zusaetze.remove(i);
+                        self.needs_reupload = true;
+                        self.mark_dirty();
+                    }
+                }
+            });
+    }
+
+    /// Setzt im markierten Bereich ein, was beschrieben ist (Hintergrund, ~1,5 min).
+    fn zusatz_starten(&mut self) {
+        let (Some(raw), Some(path)) = (self.raw_full.clone(), self.current_path()) else {
+            return;
+        };
+        if self.zusatz_seit.is_some() {
+            return;
+        }
+        let edit = self.edit_ref();
+        let flecken = self.zusatz_flecken.clone();
+        let text = self.zusatz_text.trim().to_string();
+        // Jede Erzeugung bekommt ihren eigenen Startwert (Dateiname, Variante).
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(1);
+        let tx = self.tx.clone();
+        self.zusatz_seit = Some(std::time::Instant::now());
+        self.zusatz_meldung.clear();
+        std::thread::spawn(move || {
+            let ergebnis = zusatz::erzeugen(&raw, &path, &edit, flecken, &text, seed);
+            let _ = tx.send(Msg::ZusatzFertig { path, ergebnis });
+        });
+    }
+
+    fn panorama_fenster(&mut self, ctx: &egui::Context) {
+        let mut offen = self.pano_fenster;
+        let dateien: Vec<PathBuf> = self
+            .gallery
+            .iter()
+            .zip(&self.selected)
+            .filter(|(_, s)| **s)
+            .map(|(p, _)| p.clone())
+            .collect();
+        let mut oeffnen = None;
+        egui::Window::new(t("Panorama erstellen"))
+            .id(egui::Id::new("Panorama"))
+            .open(&mut offen)
+            .default_width(460.0)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.label(tf("{} markierte Fotos, Reihenfolge egal.", &[&dateien.len()]));
+                use pipeline::panorama::Projektion as P;
+                egui::ComboBox::from_label(t("Projektion"))
+                    .selected_text(match self.pano_projektion {
+                        P::Zylinder => t("Zylinder (waagrechte Reihen)"),
+                        P::Kugel => t("Kugel (sehr weit, mehrere Reihen)"),
+                        P::Eben => t("Eben (wenige Bilder, gerade Linien)"),
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.pano_projektion, P::Zylinder, t("Zylinder (waagrechte Reihen)"));
+                        ui.selectable_value(&mut self.pano_projektion, P::Kugel, t("Kugel (sehr weit, mehrere Reihen)"));
+                        ui.selectable_value(&mut self.pano_projektion, P::Eben, t("Eben (wenige Bilder, gerade Linien)"));
+                    });
+                ui.checkbox(&mut self.pano_belichtung, t("Helligkeit der Fotos angleichen"));
+                ui.checkbox(&mut self.pano_parallaxe, t("Parallaxe ausgleichen"))
+                    .on_hover_text(t("Aus der Hand fotografiert, liegen nahe Gegenstände in den Nachbarfotos leicht versetzt. Der Ausgleich verschiebt die Fotos an den Nähten so, dass keine Doppelkonturen entstehen."));
+                ui.add_enabled_ui(pipeline::heal_ki::verfuegbar(), |ui| {
+                    ui.checkbox(&mut self.pano_fuellen, t("Leere Ränder mit der KI füllen"))
+                        .on_hover_text(t("Statt abzuschneiden ergänzt die lokale KI die ausgefransten Ränder aus dem Bildinhalt."));
+                });
+                ui.add_enabled_ui(!self.pano_fuellen, |ui| {
+                    ui.checkbox(&mut self.pano_zuschneiden, t("Automatisch auf den vollen Bildbereich zuschneiden"));
+                });
+                ui.checkbox(&mut self.pano_volle_aufloesung, t("Volle Auflösung (langsamer, viel Arbeitsspeicher)"));
+                ui.label(
+                    egui::RichText::new(t("Das Panorama wird als Rohdatei (DNG) neben den Fotos gespeichert — danach wie jedes Foto entwickeln, den Zuschnitt mit R anpassen."))
+                        .size(11.0)
+                        .weak(),
+                );
+                ui.separator();
+                if let Some((anteil, text)) = &self.pano_laeuft {
+                    ui.add(egui::ProgressBar::new(*anteil).show_percentage());
+                    ui.label(text);
+                    ctx.request_repaint_after(std::time::Duration::from_millis(250));
+                } else if ui
+                    .add_enabled(dateien.len() >= 2, egui::Button::new(t("Panorama erstellen")))
+                    .clicked()
+                {
+                    let auftrag = panorama::Auftrag {
+                        dateien: dateien.clone(),
+                        projektion: self.pano_projektion,
+                        belichtung_angleichen: self.pano_belichtung,
+                        parallaxe_ausgleichen: self.pano_parallaxe,
+                        raender_fuellen: self.pano_fuellen,
+                        zuschneiden: self.pano_zuschneiden,
+                        max_seite: if self.pano_volle_aufloesung { 0 } else { 8000 },
+                    };
+                    self.pano_laeuft = Some((0.0, t("Startet…").into()));
+                    self.pano_ergebnis = None;
+                    self.pano_meldung.clear();
+                    let tx = self.tx.clone();
+                    std::thread::spawn(move || {
+                        let tx2 = tx.clone();
+                        let r = panorama::erstellen(&auftrag, &|a, text| {
+                            let _ = tx2.send(Msg::PanoFortschritt(a, text));
+                        });
+                        let _ = tx.send(Msg::PanoFertig(r));
+                    });
+                }
+                if !self.pano_meldung.is_empty() {
+                    ui.label(egui::RichText::new(&self.pano_meldung).size(11.0));
+                }
+                if let Some(p) = &self.pano_ergebnis {
+                    if ui.button(tf("{} öffnen", &[&name_of(p)])).clicked() {
+                        oeffnen = Some(p.clone());
+                    }
+                }
+            });
+        self.pano_fenster = offen;
+        if let Some(p) = oeffnen {
+            if let Some(ordner) = p.parent() {
+                self.open_paths(vec![ordner.to_path_buf()]);
+                if let Some(i) = self.gallery.iter().position(|g| *g == p) {
+                    self.gallery_view = false;
+                    self.select(i);
+                }
+            }
+            self.pano_fenster = false;
+        }
+    }
+
+    /// Statuszeile: Update-Knopf, nur wenn es wirklich etwas Neues gibt.
+    fn update_knopf(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        if !self.update_geprueft {
+            self.update_geprueft = true;
+            let tx = self.tx.clone();
+            std::thread::spawn(move || {
+                if let Ok(Some(neu)) = updater::pruefen() {
+                    let _ = tx.send(Msg::UpdateGefunden(neu));
+                }
+            });
+        }
+        if let Some((b, g)) = self.update_laedt {
+            ui.add(egui::ProgressBar::new(b as f32 / g.max(1) as f32).desired_width(90.0).show_percentage());
+            ui.label(egui::RichText::new(t("Update lädt…")).size(11.0));
+            ctx.request_repaint_after(std::time::Duration::from_millis(250));
+            return;
+        }
+        if !self.update_meldung.is_empty() {
+            ui.label(egui::RichText::new(&self.update_meldung).size(11.0).color(farbe::AKZENT));
+        }
+        let Some(neu) = self.update_neu.clone() else { return };
+        if ui
+            .button(egui::RichText::new(tf("Update {} installieren", &[&neu.version])).size(11.0).color(farbe::AKZENT))
+            .on_hover_text(tf(
+                "Lädt Version {} ({} MB), prüft die Prüfsumme und startet Fotowache neu. Deine Bearbeitungen bleiben erhalten.",
+                &[&neu.version, &(neu.groesse / 1_000_000)],
+            ))
+            .clicked()
+        {
+            self.update_laedt = Some((0, neu.groesse));
+            self.update_meldung.clear();
+            let tx = self.tx.clone();
+            let abbruch = self.update_abbruch.clone();
+            std::thread::spawn(move || {
+                let tx2 = tx.clone();
+                let r = updater::installieren(&neu, &|b, g| {
+                    let _ = tx2.send(Msg::UpdateFortschritt(b, g));
+                }, &abbruch);
+                let _ = tx.send(Msg::UpdateFertig(r));
+            });
+        }
+    }
+
+    /// Installiert den Bildgenerator im Hintergrund.
+    fn gen_installieren(&mut self) {
+        if self.gen_laedt.is_some() {
+            return;
+        }
+        self.gen_abbruch.store(false, std::sync::atomic::Ordering::Relaxed);
+        self.gen_laedt = Some((t("KI wird vorbereitet…").into(), 0.0));
+        let tx = self.tx.clone();
+        let abbruch = self.gen_abbruch.clone();
+        std::thread::spawn(move || {
+            let gesamt = generator::paketgroesse() as f64;
+            let fertig_vorher = std::cell::Cell::new(0u64);
+            let letzte = std::cell::Cell::new(0usize);
+            let melde = |f: ki_lokal::Fortschritt| {
+                let (text, anteil) = match f {
+                    ki_lokal::Fortschritt::Laedt { datei, von, bytes, gesamt: g } => {
+                        if datei != letzte.get() {
+                            if letzte.get() > 0 {
+                                fertig_vorher.set(fertig_vorher.get() + generator::dateien()[letzte.get() - 1].groesse);
+                            }
+                            letzte.set(datei);
+                        }
+                        let ist = (fertig_vorher.get() + bytes.min(g)) as f64;
+                        (
+                            tf(
+                                "KI lädt: Datei {} von {} · {} von {} GB",
+                                &[&datei, &von, &format!("{:.1}", ist / 1e9), &format!("{:.1}", gesamt / 1e9)],
+                            ),
+                            (ist / gesamt) as f32,
+                        )
+                    }
+                    ki_lokal::Fortschritt::Entpackt => (t("KI wird eingerichtet…").to_string(), 1.0),
+                    ki_lokal::Fortschritt::Fertig => (t("Bildgenerator ist installiert.").to_string(), 1.0),
+                };
+                let _ = tx.send(Msg::GenFortschritt(text, anteil));
+            };
+            let _ = tx.send(Msg::GenInstalliert(generator::installieren(&melde, &abbruch)));
+        });
+    }
+
+    /// Erzeugt ein Bild im Hintergrund (rund eine Minute).
+    fn gen_starten(&mut self) {
+        if self.gen_seit.is_some() || self.gen_text.trim().is_empty() {
+            return;
+        }
+        let dir = ordner::ablage().join("generator");
+        let _ = std::fs::create_dir_all(&dir);
+        let ziel = dir.join(format!("bild-{}-{}.png", self.gen_seed, std::process::id()));
+        let (text, format, seed) = (self.gen_text.clone(), self.gen_format, self.gen_seed);
+        let tx = self.tx.clone();
+        self.gen_seit = Some(std::time::Instant::now());
+        self.gen_meldung.clear();
+        std::thread::spawn(move || {
+            let r = generator::erzeugen(&text, format, seed, &ziel).map(|()| ziel);
+            let _ = tx.send(Msg::GenFertig(r));
+        });
+    }
+
+    fn generator_fenster(&mut self, ctx: &egui::Context) {
+        let mut offen = self.gen_fenster;
+        egui::Window::new(t("Bild erzeugen"))
+            .id(egui::Id::new("Bildgenerator"))
+            .open(&mut offen)
+            .default_width(560.0)
+            .resizable(true)
+            .show(ctx, |ui| {
+                if let Err(grund) = generator::verfuegbar() {
+                    ui.label(grund);
+                    return;
+                }
+                if let Some((text, anteil)) = self.gen_laedt.clone() {
+                    ui.add(egui::ProgressBar::new(anteil).show_percentage());
+                    ui.label(text);
+                    if ui.button(t("abbrechen")).clicked() {
+                        self.gen_abbruch.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    ctx.request_repaint_after(std::time::Duration::from_millis(250));
+                    return;
+                }
+                if !self.gen_installiert {
+                    ui.label(t(
+                        "Erzeugt Bilder aus einer Beschreibung — komplett auf diesem Rechner, mit einem \
+                         offenen Bildmodell. Dafür wird einmalig ein eigenes Paket geladen.",
+                    ));
+                    if ui
+                        .button(tf("Bildgenerator installieren ({} GB)", &[&format!("{:.1}", generator::paketgroesse() as f64 / 1e9)]))
+                        .clicked()
+                    {
+                        self.gen_installieren();
+                    }
+                    if !self.gen_meldung.is_empty() {
+                        ui.colored_label(farbe::AKZENT, &self.gen_meldung);
+                    }
+                    return;
+                }
+                ui.label(t("Was soll zu sehen sein? (Englisch klappt am besten)"));
+                ui.add(
+                    egui::TextEdit::multiline(&mut self.gen_text)
+                        .desired_rows(3)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("a red bicycle leaning against an old stone wall, morning light, photograph"),
+                );
+                ui.horizontal(|ui| {
+                    egui::ComboBox::from_id_salt("gen_format")
+                        .selected_text(self.gen_format.label())
+                        .show_ui(ui, |ui| {
+                            for f in [generator::Format::Quer, generator::Format::Hoch, generator::Format::Quadrat] {
+                                ui.selectable_value(&mut self.gen_format, f, f.label());
+                            }
+                        });
+                    let laeuft = self.gen_seit.is_some();
+                    if ui
+                        .add_enabled(!laeuft && !self.gen_text.trim().is_empty(), egui::Button::new(t("Erzeugen")))
+                        .clicked()
+                    {
+                        self.gen_starten();
+                    }
+                    if ui
+                        .add_enabled(!laeuft && self.gen_ergebnis.is_some(), egui::Button::new(t("Nochmal (andere Variante)")))
+                        .clicked()
+                    {
+                        self.gen_seed = self.gen_seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407) >> 1;
+                        self.gen_starten();
+                    }
+                    if let Some(seit) = self.gen_seit {
+                        ui.add(egui::Spinner::new());
+                        ui.label(tf("läuft seit {} s (~1 min)", &[&seit.elapsed().as_secs()]));
+                        ctx.request_repaint_after(std::time::Duration::from_millis(500));
+                    }
+                });
+                if !self.gen_meldung.is_empty() {
+                    ui.colored_label(farbe::AKZENT, &self.gen_meldung);
+                }
+                if let Some((pfad, tex)) = &self.gen_ergebnis {
+                    let groesse = tex.size_vec2();
+                    let breite = ui.available_width().min(groesse.x);
+                    ui.add(egui::Image::new(tex).fit_to_exact_size(egui::vec2(breite, breite * groesse.y / groesse.x)));
+                    if ui.button(t("Speichern unter…")).clicked() {
+                        if let Some(ziel) = rfd::FileDialog::new().set_file_name("bild.png").add_filter("PNG", &["png"]).save_file() {
+                            self.gen_meldung = match std::fs::copy(pfad, &ziel) {
+                                Ok(_) => tf("Gespeichert: {}", &[&ziel.display()]),
+                                Err(e) => e.to_string(),
+                            };
+                        }
+                    }
+                }
+            });
+        self.gen_fenster = offen;
+    }
+
+    /// Installiert die lokale KI im Hintergrund (ein Klick).
+    fn ki_installieren(&mut self) {
+        if self.ki_laedt.is_some() {
+            return;
+        }
+        self.ki_abbruch.store(false, std::sync::atomic::Ordering::Relaxed);
+        self.ki_laedt = Some((t("KI wird vorbereitet…").into(), 0.0));
+        let tx = self.tx.clone();
+        let abbruch = self.ki_abbruch.clone();
+        std::thread::spawn(move || {
+            let gesamt = ki_lokal::paketgroesse() as f64;
+            let fertig_vorher = std::cell::Cell::new(0u64);
+            let letzte_datei = std::cell::Cell::new(0usize);
+            let melde = |f: ki_lokal::Fortschritt| {
+                let (text, anteil) = match f {
+                    ki_lokal::Fortschritt::Laedt { datei, von, bytes, gesamt: g } => {
+                        if datei != letzte_datei.get() {
+                            // Vorige Datei ist fertig: ihre Groesse zaehlt voll.
+                            if letzte_datei.get() > 0 {
+                                let d = ki_lokal::dateien()[letzte_datei.get() - 1];
+                                fertig_vorher.set(fertig_vorher.get() + d.groesse);
+                            }
+                            letzte_datei.set(datei);
+                        }
+                        let ist = (fertig_vorher.get() + bytes.min(g)) as f64;
+                        (
+                            tf(
+                                "KI lädt: Datei {} von {} · {} von {} GB",
+                                &[&datei, &von, &format!("{:.1}", ist / 1e9), &format!("{:.1}", gesamt / 1e9)],
+                            ),
+                            (ist / gesamt) as f32,
+                        )
+                    }
+                    ki_lokal::Fortschritt::Entpackt => (t("KI wird eingerichtet…").to_string(), 1.0),
+                    ki_lokal::Fortschritt::Fertig => (t("Lokale KI ist installiert.").to_string(), 1.0),
+                };
+                let _ = tx.send(Msg::KiFortschritt(text, anteil));
+            };
+            let ergebnis = ki_lokal::installieren(&melde, &abbruch);
+            let _ = tx.send(Msg::KiInstalliert(ergebnis));
         });
     }
 
@@ -1557,8 +2300,7 @@ impl App {
             .collect();
         let settings = self.batch.clone();
         let tx = self.tx.clone();
-        let use_ai = self.batch_ai && !self.ai_endpoint.is_empty();
-        let endpoint = self.ai_endpoint.clone();
+        let use_ai = self.batch_ai && self.ki_installiert;
         let strength = self.ai_strength;
         self.show_batch = false;
         std::thread::spawn(move || {
@@ -1570,7 +2312,7 @@ impl App {
                     // Die KI-Entwicklung zieht die Startwerte ohnehin pro Foto nach;
                     // ohne eigene Bearbeitung ist die neutrale Basis der Startpunkt.
                     let base = edit.clone().unwrap_or_else(presets::start_edit);
-                    develop_with_ai(&gpu, file, &base, &settings, &endpoint, strength)
+                    develop_with_ai(&gpu, file, &base, &settings, strength)
                 } else if let Some(edit) = edit {
                     export::export_one(&gpu, file, edit, &settings)
                 } else {
@@ -1929,6 +2671,8 @@ fn startwerte_nachziehen(edit: &mut Edit, frisch: &Edit) -> bool {
         neu.flip_v = alt.flip_v;
         neu.straighten = alt.straighten;
         neu.heal = alt.heal.clone();
+        neu.heal_ki = alt.heal_ki.clone();
+        neu.zusaetze = alt.zusaetze.clone();
         neu.lens_auto = alt.lens_auto;
         neu.lens_profil = alt.lens_profil.clone();
         neu.bw = alt.bw;
@@ -1954,7 +2698,6 @@ fn develop_with_ai(
     file: &Path,
     base: &Edit,
     settings: &export::ExportSettings,
-    endpoint: &str,
     strength: ai::Strength,
 ) -> Result<PathBuf, export::ExportError> {
     let raw = rawcore::decode(file, &rawcore::DecodeOptions::default())?;
@@ -1972,8 +2715,12 @@ fn develop_with_ai(
         // dasselbe, das nachher exportiert wird.
         small.objektiv = pipeline::objektiv::erkennen(&raw);
         let rgba = small.render(gpu, &edit);
-        match ai::develop(endpoint, &rgba, small.width, small.height, &edit, strength, false) {
-            Ok(r) => edit = r.edit,
+        let probe = |e: &Edit| Some((small.render(gpu, e), small.width, small.height));
+        match ai::develop(&rgba, small.width, small.height, &edit, strength, Some(&probe)) {
+            Ok(r) => {
+                println!("{}", tf("  KI: {} · {} — {}", &[&r.scene_label, &r.look, &r.description]));
+                edit = r.edit;
+            }
             Err(e) => eprintln!("{}", tf("KI übersprungen für {}: {}", &[&name_of(file), &e])),
         }
     }
@@ -2134,6 +2881,11 @@ fn slider(ui: &mut egui::Ui, label: &str, value: &mut f32, min: f32, max: f32, d
 }
 
 impl eframe::App for App {
+    /// Beim Schliessen den KI-Dienst beenden — er belegt sonst Gigabytes.
+    fn on_exit(&mut self) {
+        ki_lokal::beenden();
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.zeichnen(ctx);
     }
@@ -2223,8 +2975,17 @@ impl App {
                 self.center(ctx);
             }
         }
-        if self.show_log && !self.ai_endpoint.is_empty() {
+        if self.show_log {
             self.log_fenster(ctx);
+        }
+        if self.gen_fenster {
+            self.generator_fenster(ctx);
+        }
+        if self.pano_fenster {
+            self.panorama_fenster(ctx);
+        }
+        if self.heal_mode && self.hinzufuegen_modus && generator::installiert() {
+            self.hinzufuegen_fenster(ctx);
         }
         if self.show_batch {
             self.batch_window(ctx);
@@ -2401,10 +3162,31 @@ impl App {
                     self.einstellungen_einfuegen();
                 }
                 ui.separator();
-                // Ohne KI-Server (siehe `ki_endpunkt`) fehlt dieser ganze Block —
-                // ein Knopf, der nur Fehler liefert, waere schlimmer als keiner.
-                let ki_da = !self.ai_endpoint.is_empty();
-                if ki_da {
+                // Lokale KI: ohne Installation ein Knopf zum Installieren (ein Klick,
+                // einmalig), waehrend des Ladens der Fortschritt, danach die KI.
+                if let Some((text, anteil)) = self.ki_laedt.clone() {
+                    ui.add(egui::ProgressBar::new(anteil).desired_width(140.0).show_percentage());
+                    ui.label(egui::RichText::new(text).size(11.0));
+                    if ui.button(t("abbrechen")).clicked() {
+                        self.ki_abbruch.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    ctx.request_repaint_after(std::time::Duration::from_millis(250));
+                } else if !self.ki_installiert {
+                    if let Err(grund) = ki_lokal::verfuegbar() {
+                        ui.label(egui::RichText::new(t("Lokale KI nicht verfügbar")).size(11.0).weak())
+                            .on_hover_text(grund);
+                    } else if ui
+                            .button(tf("Lokale KI installieren ({} GB)", &[&format!("{:.1}", ki_lokal::paketgroesse() as f64 / 1e9)]))
+                            .on_hover_text(t(
+                                "Lädt einmalig ein Bildmodell und ein Retusche-Modell auf diesen \
+                                 Rechner. Danach läuft die KI komplett lokal — kein Foto verlässt \
+                                 den Rechner, kein Konto, keine Kosten.",
+                            ))
+                            .clicked()
+                    {
+                        self.ki_installieren();
+                    }
+                } else {
                     let magic = egui::Button::new(if self.ai_busy {
                         t("KI denkt…")
                     } else {
@@ -2412,23 +3194,11 @@ impl App {
                     });
                     if ui
                         .add_enabled(has && !self.ai_busy, magic)
-                        .on_hover_text(t("Die KI schaut sich das Foto an und setzt die Regler"))
+                        .on_hover_text(t("Die lokale KI schaut sich das Foto an und entwickelt es passend zur Szene"))
                         .clicked()
                     {
                         self.start_ai();
                     }
-                    egui::ComboBox::from_id_salt("ki_runden")
-                        .selected_text(match self.ai_rounds {
-                            0 => t("ohne Prüfung"),
-                            1 => t("1× prüfen"),
-                            _ => t("2× prüfen"),
-                        })
-                        .width(110.0)
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut self.ai_rounds, 0, t("ohne Prüfung"));
-                            ui.selectable_value(&mut self.ai_rounds, 1, t("1× prüfen"));
-                            ui.selectable_value(&mut self.ai_rounds, 2, t("2× prüfen"));
-                        });
                     egui::ComboBox::from_id_salt("ki_staerke")
                         .selected_text(self.ai_strength.label())
                         .width(80.0)
@@ -2437,18 +3207,22 @@ impl App {
                                 ui.selectable_value(&mut self.ai_strength, s, s.label());
                             }
                         });
-                    // Alles, was auf das BILD wirkt (Zuschnitt, Zoom, Drehen, Sterne,
-                    // Vollbild), sitzt nicht mehr hier oben, sondern als schwebende
-                    // Leiste direkt am Bild — dort, wo man hinschaut, und im Vollbild
-                    // genauso erreichbar. Hier bleibt Dateiarbeit und KI.
                     ui.separator();
                     if ui
                         .selectable_label(self.show_log, t("KI-Protokoll"))
-                        .on_hover_text(t("Was die KI gemacht hat — Runde für Runde"))
+                        .on_hover_text(t("Was die KI gesehen und gemacht hat"))
                         .clicked()
                     {
                         self.show_log = !self.show_log;
                     }
+                }
+                if generator::verfuegbar().is_ok()
+                    && ui
+                        .selectable_label(self.gen_fenster, t("Bild erzeugen…"))
+                        .on_hover_text(t("Ein Bild aus einer Beschreibung erzeugen — lokal, ohne Konto"))
+                        .clicked()
+                {
+                    self.gen_fenster = !self.gen_fenster;
                 }
                 if ui.selectable_label(self.gallery_view, t("Galerie (G)")).clicked() {
                     self.gallery_view = !self.gallery_view;
@@ -2467,6 +3241,15 @@ impl App {
                     .clicked()
                 {
                     self.show_batch = true;
+                }
+                let markiert = self.selected.iter().filter(|s| **s).count();
+                if ui
+                    .add_enabled(markiert >= 2, egui::Button::new(t("Panorama…")))
+                    .on_hover_text(t("Aus den markierten Fotos ein Panorama zusammensetzen (mindestens zwei markieren)"))
+                    .clicked()
+                {
+                    self.pano_fenster = true;
+                    self.pano_fuellen = pipeline::heal_ki::verfuegbar();
                 }
             });
             ui.add_space(4.0);
@@ -2496,6 +3279,7 @@ impl App {
                         // Ganz rechts die Sprachwahl — unten statt in der Kopfleiste,
                         // die mit allen Knoepfen schon die Fensterbreite fuellt.
                         self.sprachwahl(ui);
+                        self.update_knopf(ui, ctx);
                         if let Some(m) = &self.image_meta {
                             // Manche DNGs nennen keine Kamera — dann ohne
                             // fuehrende Leerstelle und Trennpunkt.
@@ -2737,13 +3521,38 @@ impl App {
                             .show_value(false)
                             .text(t("Größe")),
                     );
-                    let n = self.edit_ref().heal.len();
+                    if generator::installiert() {
+                        ui.checkbox(&mut self.hinzufuegen_modus, t("Hinzufügen"))
+                            .on_hover_text(t(
+                                "Bereich anmalen und beschreiben, was dort erscheinen soll — \
+                                 z. B. Wolken am klaren Himmel (lokal, ~1,5 min).",
+                            ));
+                    }
+                    if ki_lokal::retusche_modell().is_some() && !self.hinzufuegen_modus {
+                        ui.checkbox(&mut self.heal_ki_modus, t("KI-Füllung"))
+                            .on_hover_text(t(
+                                "An: die lokale KI erfindet die Stelle aus der Umgebung neu \
+                                 (auch große Objekte, ~2 s). Aus: eine passende Nachbarstelle \
+                                 wird kopiert (schnell, für kleine Flecken).",
+                            ));
+                    }
+                    let n = self.edit_ref().heal.len() + self.edit_ref().heal_ki.len();
                     if ui
                         .add_enabled(n > 0, egui::Button::new(tf("zurück ({})", &[&n])))
                         .clicked()
                     {
                         self.push_undo();
-                        self.edit().heal.pop();
+                        // Zuerst aus der Liste des gewaehlten Pinsels, sonst aus der anderen.
+                        let ki_zuerst = self.heal_ki_modus;
+                        let e = self.edit();
+                        let (erste, zweite) = if ki_zuerst {
+                            (&mut e.heal_ki, &mut e.heal)
+                        } else {
+                            (&mut e.heal, &mut e.heal_ki)
+                        };
+                        if erste.pop().is_none() {
+                            zweite.pop();
+                        }
                         self.needs_reupload = true;
                         self.mark_dirty();
                     }
@@ -2997,6 +3806,8 @@ impl App {
             neu.flip_v = alt.flip_v;
             neu.straighten = alt.straighten;
             neu.heal = alt.heal.clone();
+            neu.heal_ki = alt.heal_ki.clone();
+            neu.zusaetze = alt.zusaetze.clone();
             neu.bearbeitet = true;
             self.edits.insert(p.clone(), neu.clone());
             if Some(p) != aktuell.as_ref() {
@@ -3164,6 +3975,8 @@ impl App {
         e.flip_v = alt.flip_v;
         e.straighten = alt.straighten;
         e.heal = alt.heal;
+        e.heal_ki = alt.heal_ki;
+        e.zusaetze = alt.zusaetze;
         // Die Objektiv-Profilwahl gehoert zum Foto (welches Glas war drauf),
         // nicht zum Look — eine Vorlage darf sie nicht zuruecksetzen.
         e.lens_auto = alt.lens_auto;
@@ -3771,9 +4584,10 @@ impl App {
                         // Der Regler meint, was man auf dem Bildschirm sieht;
                         // gespeichert wird in Quellmassen.
                         let r = self.heal_radius * self.pinsel_faktor();
-                        let neu = self
-                            .edit_ref()
-                            .heal
+                        let ki = self.heal_ki_modus && ki_lokal::retusche_modell().is_some();
+                        let hinzu = self.hinzufuegen_modus && generator::installiert();
+                        let e = self.edit_ref();
+                        let neu = if hinzu { &self.zusatz_flecken } else if ki { &e.heal_ki } else { &e.heal }
                             .last()
                             // Beim Ziehen nicht jeden Mauspunkt einzeln nehmen —
                             // sonst stapeln sich hundert Flecken uebereinander und
@@ -3783,11 +4597,18 @@ impl App {
                                 d > r * 0.8
                             })
                             .unwrap_or(true);
-                        if neu {
+                        if neu && hinzu {
+                            // Nur markieren — eingesetzt wird erst auf Knopfdruck.
+                            self.zusatz_flecken.push([x, y, r]);
+                        } else if neu {
                             if resp.clicked() {
                                 self.push_undo();
                             }
-                            self.edit().heal.push([x, y, r]);
+                            if ki {
+                                self.edit().heal_ki.push([x, y, r]);
+                            } else {
+                                self.edit().heal.push([x, y, r]);
+                            }
                             self.needs_reupload = true;
                             self.mark_dirty();
                         }
@@ -3871,7 +4692,8 @@ impl App {
             if self.heal_mode {
                 // Bereits geschlossene Stellen markieren, damit man sieht, was man
                 // schon gemacht hat — die Retusche selbst ist ja unsichtbar.
-                for [hx, hy, hr] in self.edit_ref().heal.iter() {
+                let e = self.edit_ref();
+                for [hx, hy, hr] in e.heal.iter().chain(e.heal_ki.iter()) {
                     let (dx, dy) = quelle_zu_anzeige(*hx, *hy, &self.anzeige_edit());
                     let c = img_rect.left_top()
                         + egui::vec2(dx * img_rect.width(), dy * img_rect.height());
@@ -3879,6 +4701,17 @@ impl App {
                         c,
                         hr / self.pinsel_faktor().max(1e-6) * img_rect.width(),
                         egui::Stroke::new(1.0_f32, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 90)),
+                    );
+                }
+                // Der Bereich fuer „Hinzufuegen" — gefuellt, damit man sieht,
+                // wohin etwas kommt.
+                for [hx, hy, hr] in self.zusatz_flecken.iter() {
+                    let (dx, dy) = quelle_zu_anzeige(*hx, *hy, &self.anzeige_edit());
+                    let c = img_rect.left_top() + egui::vec2(dx * img_rect.width(), dy * img_rect.height());
+                    painter.circle_filled(
+                        c,
+                        hr / self.pinsel_faktor().max(1e-6) * img_rect.width(),
+                        egui::Color32::from_rgba_unmultiplied(230, 170, 60, 60),
                     );
                 }
                 if let Some(p) = resp.hover_pos() {
@@ -3975,19 +4808,28 @@ impl App {
         }
         // Retusche auch im Zoom: sonst waere ausgerechnet beim genauen Hinsehen
         // die Stelle wieder da, die man weggemacht hat.
-        let heal_lokal: Vec<[f32; 3]> = edit
-            .heal
+        let lokal = |liste: &[[f32; 3]]| -> Vec<[f32; 3]> {
+            liste
+                .iter()
+                .map(|[hx, hy, hr]| {
+                    [
+                        (hx * raw.width as f32 - want.0 as f32) / want.2 as f32,
+                        (hy * raw.height as f32 - want.1 as f32) / want.3 as f32,
+                        hr * raw.width as f32 / want.2 as f32,
+                    ]
+                })
+                .collect()
+        };
+        let (heal_lokal, heal_ki_lokal) = (lokal(&edit.heal), lokal(&edit.heal_ki));
+        let stuecke_lokal: Vec<pipeline::zusatz::Stueck> = self
+            .current_path()
+            .map(|p| zusatz::stuecke(&p, &edit.zusaetze))
+            .unwrap_or_default()
             .iter()
-            .map(|[hx, hy, hr]| {
-                [
-                    (hx * raw.width as f32 - want.0 as f32) / want.2 as f32,
-                    (hy * raw.height as f32 - want.1 as f32) / want.3 as f32,
-                    hr * raw.width as f32 / want.2 as f32,
-                ]
-            })
+            .map(|z| z.im_ausschnitt(raw.width, raw.height, want.0, want.1, want.2, want.3))
             .collect();
-        if let Ok(mut region) =
-            GpuImage::upload_region_mit(gpu, raw, want.0, want.1, want.2, want.3, &heal_lokal)
+        let retusche = pipeline::Retusche { heal: &heal_lokal, heal_ki: &heal_ki_lokal, zusaetze: &stuecke_lokal };
+        if let Ok(mut region) = GpuImage::upload_region_mit(gpu, raw, want.0, want.1, want.2, want.3, &retusche)
         {
             // Der Ausschnitt muss im VOLLEN Bildbezug entzerren — kachel-lokal
             // gerechnet spraenge er gegenueber der Vorschau.
@@ -4196,16 +5038,16 @@ impl App {
                         .weak(),
                 );
 
-                // Ohne KI-Server keine KI-Wahl — der Stapel laeuft dann ohne.
-                if !self.ai_endpoint.is_empty() {
+                // Ohne lokale KI keine KI-Wahl — der Stapel laeuft dann ohne.
+                if self.ki_installiert {
                     ui.separator();
                     ui.checkbox(&mut self.batch_ai, t("jedes Foto von der KI entwickeln lassen"));
                     if self.batch_ai {
                         ui.label(
                             egui::RichText::new(t(
-                                "Die KI sieht sich jedes Foto einzeln an — gründlicher, aber \
-                                 deutlich langsamer (nacheinander, ~10–20 s pro Foto). \
-                                 Antwortet der KI-Server nicht, wird das Foto trotzdem entwickelt.",
+                                "Die lokale KI sieht sich jedes Foto einzeln an — passend zur \
+                                 Szene, aber langsamer (~10 s pro Foto). Klappt es bei einem \
+                                 Foto nicht, wird es trotzdem entwickelt.",
                             ))
                             .size(11.0)
                             .weak(),

@@ -61,13 +61,53 @@ photo in milliseconds.
   standard base tone curve, Bradford white balance in a linear wide-gamut working
   space (ROMM RGB), gamut mapping on output.
 - **Clipping warning (J), before/after (\\), white-balance picker (W), black &
-  white (V), crop and straighten (R), object removal brush, lossless
+  white (V), crop and straighten (R), object removal brush (with AI fill), lossless
   rotate/flip, one undo step per slider drag (Ctrl/⌘ + Z), copy/paste settings
   between photos (Ctrl/⌘ + Shift + C / V).**
 - **Film looks:** eleven film-style starting points (balanced, brilliant,
   gentle, muted, retro negative, filmic, fine black & white …) for cameras that
   write RAF files, plus exposure compensation for their extended dynamic range
   modes and demosaicing for their 6×6 colour filter pattern.
+
+### Local AI — on your computer, optional
+One click on **Install local AI** downloads the models once (about 3.3 GB, each
+file verified by SHA-256; an interrupted download resumes). After that
+everything runs on your own computer: no photo leaves it, no account, no cost.
+
+- **Develop with AI.** The AI looks at the photo, recognises the scene
+  (portrait, group, landscape, city, sunset, night, food …), the light, people,
+  sky, haze and unwanted colour casts, and develops it to suit: landscapes a
+  little clearer and more vivid, portraits softer, cities crisper — on top of the
+  automatic settings, which stay in charge of exposure. Strength gentle, normal
+  or strong; the AI log shows what it saw and changed. About 10 s per photo.
+- **Remove objects with AI fill.** Paint over a person, a sign or a boat — the
+  area is recreated from its surroundings, also where there is nothing to copy
+  from (~2 s). The classic copy brush stays available for small spots.
+- **Add things that were not there.** Paint an area and describe what should
+  appear — clouds in an empty sky, for example. The new content is placed into
+  the raw data, so it is developed exactly like the rest of the photo and follows
+  every slider afterwards (~1.5 min, needs the image generator below).
+- **Image generator (bonus).** Create images from a description with an open
+  image model, also fully local (separate download of about 5.2 GB, roughly one
+  minute per image).
+
+The local AI is not offered on systems whose C library is too old (glibc older
+than 2.38); the image generator needs a recent system version on every platform.
+
+### Panorama
+- **Select two or more photos in the gallery, then click Panorama…** Fotowache
+  finds the overlaps itself (order does not matter, photos that do not belong are
+  left out and named in the report), aligns all photos together, estimates the
+  focal length and lens distortion, matches brightness and hides the seams.
+- **Projections:** cylinder (one horizontal row), sphere (very wide or several
+  rows) or flat (few photos, straight lines stay straight).
+- **Edges:** crop automatically to the largest fully covered rectangle, or let
+  the local AI fill the empty edges from the picture content.
+- **The result is a raw file again** (linear DNG next to the photos): develop
+  it with every slider, the automatic settings or the AI, retouch it, and
+  adjust the suggested crop with the crop tool (R).
+- **Command line:** `fotowache --panorama <files…> [--projektion
+  zylinder|kugel|eben] [--raender-fuellen] [--ohne-zuschnitt] [--voll]`.
 
 ### Almost every camera, every lens
 - **Reads RAW files from more than a thousand camera models** — compact
@@ -113,6 +153,11 @@ software. Run them again to update; add `--uninstall` (macOS/Linux) or
 `-Uninstall` (Windows, see the comment at the top of `install.ps1`) to remove
 Fotowache. Your photos and edit files stay where they are.
 
+**Updates:** when a newer release exists, a button appears at the bottom of
+the window. One click downloads the matching package, checks it against the
+release checksums, replaces the installed copy and restarts Fotowache — for the
+app bundle, the Windows setup, the AppImage and the command-line install alike.
+
 **First start of a downloaded file:**
 - *macOS* says the app "cannot be opened": right-click Fotowache in
   Applications → **Open** → **Open** (once), or *System Settings → Privacy &
@@ -132,6 +177,10 @@ system's software renderer (slow, but it works).
 - **Where your edits live:** `<photo>.fotowache.json` next to each RAW file —
   move the folder and the edits move with it. Delete the file to start over.
 - **XMP sidecars** are read, never written.
+- **Network:** Fotowache goes online only to look for a newer release (one
+  request at start; `FOTOWACHE_KEINE_UPDATES=1` turns it off), to download an
+  update when you click it, and to download the optional local AI when you
+  install it. Photos never leave the computer.
 - **Display profile:** where the system provides the colour profile of the
   display, the preview is converted to it, so wide-gamut screens do not
   oversaturate; exports are sRGB.

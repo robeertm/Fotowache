@@ -67,6 +67,26 @@ Adobe Systems Incorporated
 Camera and lens profiles of other software are NOT included. Fotowache only reads
 profiles that other software has installed on the user's computer.
 
+## Optional downloads (local AI, image generator)
+
+These components are NOT part of the packages. They are downloaded only when the
+user clicks “Install local AI” or “Install image generator”, directly from the
+original publishers, each pinned to a fixed version and verified by SHA-256.
+They keep their own licences:
+
+- **llama.cpp** (inference runtime for the vision model), MIT License,
+  Copyright © the ggml authors — <https://github.com/ggml-org/llama.cpp>
+- **Huihui-Qwen3.5-4B-abliterated** (vision-language model, GGUF build by
+  mradermacher), Apache License 2.0, derived from Qwen3.5-4B by the Qwen team
+- **LaMa** inpainting model (ONNX export by Carve), Apache License 2.0,
+  Copyright © the LaMa authors — <https://github.com/advimman/lama>
+- **stable-diffusion.cpp** (inference runtime for the image generator), MIT
+  License, Copyright © leejet — <https://github.com/leejet/stable-diffusion.cpp>
+- **FLUX.2 [klein] 4B** (image model, GGUF build by leejet, and its VAE),
+  Apache License 2.0, Copyright © Black Forest Labs
+- **Qwen3-4B** (text encoder of the image generator, GGUF build by unsloth),
+  Apache License 2.0, Copyright © the Qwen team
+
 ## Rust libraries
 
 The following crates are compiled into Fotowache. Each entry gives the licence
