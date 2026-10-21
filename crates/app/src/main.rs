@@ -116,9 +116,58 @@ fn main() -> eframe::Result<()> {
         }
         std::process::exit(0);
     }
+    // Freier Modus ohne Fenster: Alter bestaetigen, Modell laden, entfernen.
+    if argv.first().map(|a| a == "--frei-bestaetigen").unwrap_or(false) {
+        let teile: Vec<i64> = argv
+            .get(1)
+            .map(|d| d.split(['.', '-', '/']).filter_map(|v| v.trim().parse().ok()).collect())
+            .unwrap_or_default();
+        let r = match teile.as_slice() {
+            [tag, monat, jahr] => generator::volljaehrigkeit_bestaetigen(*tag as u32, *monat as u32, *jahr as i32),
+            _ => Err(t("Bitte ein gültiges Geburtsdatum eingeben (TT.MM.JJJJ).").into()),
+        };
+        match r {
+            Ok(()) => println!("{}", t("Volljährigkeit bestätigt.")),
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        }
+        std::process::exit(0);
+    }
+    if argv.first().map(|a| a == "--frei-installieren").unwrap_or(false) {
+        let abbruch = std::sync::atomic::AtomicBool::new(false);
+        let zuletzt = std::cell::Cell::new(0u64);
+        let r = generator::frei_installieren(
+            &|f| {
+                if let ki_lokal::Fortschritt::Laedt { datei, von, bytes, gesamt } = f {
+                    if bytes / 100_000_000 != zuletzt.get() || bytes == gesamt {
+                        zuletzt.set(bytes / 100_000_000);
+                        println!("[{datei}/{von}] {:.0} / {:.0} MB", bytes as f64 / 1e6, gesamt as f64 / 1e6);
+                    }
+                }
+            },
+            &abbruch,
+        );
+        match r {
+            Ok(()) => println!("{}", t("Freies Bildmodell ist installiert.")),
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        }
+        std::process::exit(0);
+    }
+    if argv.first().map(|a| a == "--frei-entfernen").unwrap_or(false) {
+        let _ = generator::frei_entfernen();
+        generator::bestaetigung_zuruecknehmen();
+        println!("{}", t("Freies Bildmodell entfernt."));
+        std::process::exit(0);
+    }
     if argv.first().map(|a| a == "--bild").unwrap_or(false) {
-        // fotowache --bild "<Beschreibung>" --ziel bild.png [--format quer|hoch|quadrat] [--seed n]
+        // fotowache --bild "<Beschreibung>" --ziel bild.png [--format quer|hoch|quadrat] [--seed n] [--frei]
         let mut text = None;
+        let mut frei = false;
         let mut ziel = PathBuf::from("bild.png");
         let mut format = generator::Format::Quer;
         let mut seed = 1u64;
@@ -134,15 +183,21 @@ fn main() -> eframe::Result<()> {
                     }
                 }
                 "--seed" => seed = it.next().and_then(|s| s.parse().ok()).unwrap_or(seed),
+                "--frei" => frei = true,
                 other => text = Some(other.to_string()),
             }
         }
         let Some(text) = text else {
-            eprintln!("fotowache --bild \"<…>\" --ziel bild.png [--format quer|hoch|quadrat] [--seed n]");
+            eprintln!("fotowache --bild \"<…>\" --ziel bild.png [--format quer|hoch|quadrat] [--seed n] [--frei]");
             std::process::exit(2);
         };
         let beginn = std::time::Instant::now();
-        match generator::erzeugen(&text, format, seed, &ziel) {
+        let r = if frei {
+            generator::frei_erzeugen(&text, format, seed, &ziel)
+        } else {
+            generator::erzeugen(&text, format, seed, &ziel)
+        };
+        match r {
             Ok(()) => println!("{} ({:.0} s)", ziel.display(), beginn.elapsed().as_secs_f32()),
             Err(e) => {
                 eprintln!("{e}");
@@ -681,7 +736,8 @@ enum Msg {
     /// Installation beendet (Fehlertext oder Erfolg).
     KiInstalliert(Result<(), String>),
     GenFortschritt(String, f32),
-    GenInstalliert(Result<(), String>),
+    /// (freier Modus?, Ergebnis)
+    GenInstalliert(bool, Result<(), String>),
     /// Ein erzeugtes Bild liegt bereit (Pfad der PNG-Datei).
     GenFertig(Result<PathBuf, String>),
     /// Panorama: Fortschritt (Anteil, Text) / fertig.
@@ -752,6 +808,10 @@ struct App {
     zoom: f32,
     pan: egui::Vec2,
     detail: Option<GpuImage>,
+    /// Was in `detail` geladen ist: Sensorbereich (x, y, b, h) und die
+    /// Groesse der Textur (b, h) — kleiner als der Bereich, wenn der Schirm
+    /// weniger Pixel zeigt als das Original hat (eingepasste Ansicht).
+    detail_quelle: Option<(u32, u32, u32, u32, u32, u32)>,
     detail_rect: Option<(u32, u32, u32, u32)>,
     /// Der nachgeladene Ausschnitt als eigene Textur — bewusst NEBEN der Vorschau
     /// und nicht statt ihr: er deckt nur einen Teil des Bildes ab.
@@ -861,6 +921,13 @@ struct App {
     gen_seit: Option<std::time::Instant>,
     gen_ergebnis: Option<(PathBuf, egui::TextureHandle)>,
     gen_meldung: String,
+    /// Freier Modus (ab 18) angehakt — gilt nur fuer diese Sitzung.
+    gen_frei: bool,
+    gen_frei_bestaetigt: bool,
+    gen_frei_installiert: bool,
+    /// Eingabe des Geburtsdatums fuer die Altersbestaetigung (wird nie gespeichert).
+    gen_geburt: String,
+    gen_frei_zusage: bool,
     ai_strength: ai::Strength,
     ai_busy: bool,
     ai_note: String,
@@ -928,6 +995,7 @@ impl App {
             zoom: 1.0,
             pan: egui::Vec2::ZERO,
             detail: None,
+            detail_quelle: None,
             detail_rect: None,
             detail_tex: None,
             texture: None,
@@ -998,6 +1066,11 @@ impl App {
             gen_seit: None,
             gen_ergebnis: None,
             gen_meldung: String::new(),
+            gen_frei: false,
+            gen_frei_bestaetigt: generator::volljaehrig_bestaetigt(),
+            gen_frei_installiert: generator::frei_installiert(),
+            gen_geburt: String::new(),
+            gen_frei_zusage: false,
             ai_strength: ai::Strength::Normal,
             ai_busy: false,
             ai_note: String::new(),
@@ -1145,6 +1218,7 @@ impl App {
         self.image = None;
         self.raw_full = None;
         self.detail = None;
+        self.detail_quelle = None;
         self.detail_rect = None;
         self.detail_tex = None;
         self.thumb_aktuell = None;
@@ -1312,6 +1386,7 @@ impl App {
                                     self.zoom = 1.0;
                                     self.pan = egui::Vec2::ZERO;
                                     self.detail = None;
+                                    self.detail_quelle = None;
                                     self.detail_rect = None;
                                     self.detail_tex = None;
                                     // Grundhelligkeit nur bei NEUEN Fotos setzen —
@@ -1365,6 +1440,7 @@ impl App {
                                     }
                                     self.image = Some(img);
                                     self.detail = None;
+                                    self.detail_quelle = None;
                                     self.detail_rect = None;
                                     self.detail_tex = None;
                                     self.needs_render = true;
@@ -1454,9 +1530,10 @@ impl App {
                         Err(e) => self.zusatz_meldung = e,
                     }
                 }
-                Msg::GenInstalliert(ergebnis) => {
+                Msg::GenInstalliert(frei, ergebnis) => {
                     self.gen_laedt = None;
                     match ergebnis {
+                        Ok(()) if frei => self.gen_frei_installiert = true,
                         Ok(()) => self.gen_installiert = true,
                         Err(e) => self.gen_meldung = tf("Installation: {}", &[&e]),
                     }
@@ -1550,29 +1627,37 @@ impl App {
         }
     }
 
+    /// Was gerade zu sehen sein soll: die Bearbeitung — oder, solange
+    /// „Vorher/Nachher" gedrueckt ist, der unbearbeitete Look.
+    ///
+    /// „Vorher" vergleicht den LOOK, nicht die Geometrie: Grundhelligkeit,
+    /// Zuschnitt, Drehung und Geraderichten bleiben stehen — sonst springt
+    /// beim Halten des Knopfs ein Hochformat kurz ins Querformat, und der
+    /// Zuschnitt saesse an der falschen Stelle. Vorschau UND nachgeladener
+    /// Ausschnitt rechnen damit (der Ausschnitt zeigte vorher beim Halten
+    /// weiter den bearbeiteten Stand).
+    fn gezeigte_bearbeitung(&self) -> Edit {
+        let cur = self.edit_ref();
+        if !self.show_before {
+            return cur;
+        }
+        let mut e = presets::start_edit();
+        e.base_ev = cur.base_ev;
+        e.crop = cur.crop;
+        e.rotate = cur.rotate;
+        e.flip_h = cur.flip_h;
+        e.flip_v = cur.flip_v;
+        e.straighten = cur.straighten;
+        e.lens_auto = cur.lens_auto;
+        e.lens_profil = cur.lens_profil.clone();
+        e
+    }
+
     fn render_preview(&mut self, ctx: &egui::Context) {
         let (Some(gpu), Some(img)) = (&self.gpu, &self.image) else {
             return;
         };
-        let edit = if self.show_before {
-            // „Vorher" vergleicht den LOOK, nicht die Geometrie: Grundhelligkeit,
-            // Zuschnitt, Drehung und Geraderichten bleiben stehen — sonst springt
-            // beim Halten des Knopfs ein Hochformat kurz ins Querformat, und der
-            // Zuschnitt saesse an der falschen Stelle.
-            let cur = self.edit_ref();
-            let mut e = presets::start_edit();
-            e.base_ev = cur.base_ev;
-            e.crop = cur.crop;
-            e.rotate = cur.rotate;
-            e.flip_h = cur.flip_h;
-            e.flip_v = cur.flip_v;
-            e.straighten = cur.straighten;
-            e.lens_auto = cur.lens_auto;
-            e.lens_profil = cur.lens_profil.clone();
-            e
-        } else {
-            self.edit_ref()
-        };
+        let edit = self.gezeigte_bearbeitung();
         let t = std::time::Instant::now();
         // `render_screen` statt `render`: die Vorschau geht ins erkannte
         // Monitorprofil, nicht nach sRGB. Der Export bleibt sRGB — siehe
@@ -2059,8 +2144,8 @@ impl App {
         }
     }
 
-    /// Installiert den Bildgenerator im Hintergrund.
-    fn gen_installieren(&mut self) {
+    /// Installiert den Bildgenerator (bzw. das freie Bildmodell) im Hintergrund.
+    fn gen_installieren(&mut self, frei: bool) {
         if self.gen_laedt.is_some() {
             return;
         }
@@ -2069,7 +2154,8 @@ impl App {
         let tx = self.tx.clone();
         let abbruch = self.gen_abbruch.clone();
         std::thread::spawn(move || {
-            let gesamt = generator::paketgroesse() as f64;
+            let dateien = if frei { generator::frei_dateien() } else { generator::dateien() };
+            let gesamt = dateien.iter().map(|d| d.groesse).sum::<u64>() as f64;
             let fertig_vorher = std::cell::Cell::new(0u64);
             let letzte = std::cell::Cell::new(0usize);
             let melde = |f: ki_lokal::Fortschritt| {
@@ -2077,7 +2163,7 @@ impl App {
                     ki_lokal::Fortschritt::Laedt { datei, von, bytes, gesamt: g } => {
                         if datei != letzte.get() {
                             if letzte.get() > 0 {
-                                fertig_vorher.set(fertig_vorher.get() + generator::dateien()[letzte.get() - 1].groesse);
+                                fertig_vorher.set(fertig_vorher.get() + dateien[letzte.get() - 1].groesse);
                             }
                             letzte.set(datei);
                         }
@@ -2095,7 +2181,12 @@ impl App {
                 };
                 let _ = tx.send(Msg::GenFortschritt(text, anteil));
             };
-            let _ = tx.send(Msg::GenInstalliert(generator::installieren(&melde, &abbruch)));
+            let r = if frei {
+                generator::frei_installieren(&melde, &abbruch)
+            } else {
+                generator::installieren(&melde, &abbruch)
+            };
+            let _ = tx.send(Msg::GenInstalliert(frei, r));
         });
     }
 
@@ -2108,11 +2199,26 @@ impl App {
         let _ = std::fs::create_dir_all(&dir);
         let ziel = dir.join(format!("bild-{}-{}.png", self.gen_seed, std::process::id()));
         let (text, format, seed) = (self.gen_text.clone(), self.gen_format, self.gen_seed);
+        let frei = self.gen_frei && self.gen_frei_bestaetigt && self.gen_frei_installiert;
+        // Die Sperre schon hier: eine gesperrte Beschreibung startet gar nicht erst.
+        if frei && generator::frei_gesperrt(&text) {
+            self.gen_meldung = t(
+                "Diese Beschreibung ist im freien Modus gesperrt: nichts, was auf Kinder oder Jugendliche zielt. \
+                 Beschreibe Erwachsene (Frau, Mann).",
+            )
+            .into();
+            return;
+        }
         let tx = self.tx.clone();
         self.gen_seit = Some(std::time::Instant::now());
         self.gen_meldung.clear();
         std::thread::spawn(move || {
-            let r = generator::erzeugen(&text, format, seed, &ziel).map(|()| ziel);
+            let r = if frei {
+                generator::frei_erzeugen(&text, format, seed, &ziel)
+            } else {
+                generator::erzeugen(&text, format, seed, &ziel)
+            }
+            .map(|()| ziel);
             let _ = tx.send(Msg::GenFertig(r));
         });
     }
@@ -2121,6 +2227,10 @@ impl App {
         let mut offen = self.gen_fenster;
         egui::Window::new(t("Bild erzeugen"))
             .id(egui::Id::new("Bildgenerator"))
+            // Mittig unter der Leiste — oben links laege die Sternleiste ueber
+            // dem Fenstertitel (am Bildschirmfoto-Pruefstand gesehen).
+            .pivot(egui::Align2::CENTER_TOP)
+            .default_pos(egui::pos2(ctx.content_rect().center().x, 110.0))
             .open(&mut offen)
             .default_width(560.0)
             .resizable(true)
@@ -2147,12 +2257,88 @@ impl App {
                         .button(tf("Bildgenerator installieren ({} GB)", &[&format!("{:.1}", generator::paketgroesse() as f64 / 1e9)]))
                         .clicked()
                     {
-                        self.gen_installieren();
+                        self.gen_installieren(false);
                     }
                     if !self.gen_meldung.is_empty() {
                         ui.colored_label(farbe::AKZENT, &self.gen_meldung);
                     }
                     return;
+                }
+                // --- Freier Modus (ab 18) ---------------------------------------
+                let laeuft = self.gen_seit.is_some();
+                ui.add_enabled_ui(!laeuft, |ui| {
+                    ui.checkbox(&mut self.gen_frei, t("Freier Modus (ab 18)"))
+                        .on_hover_text(t(
+                            "Ein zweites, offenes Bildmodell ohne Inhaltsfilter — für Erwachsene. \
+                             Nichts mit Minderjährigen, nur Bilder aus einer Beschreibung, nie aus deinen Fotos.",
+                        ));
+                });
+                if self.gen_frei && !self.gen_frei_bestaetigt {
+                    egui::Frame::group(ui.style()).show(ui, |ui| {
+                        ui.label(egui::RichText::new(t("Altersbestätigung")).strong());
+                        ui.label(t(
+                            "Der freie Modus kann Nacktheit und Inhalte für Erwachsene erzeugen. \
+                             Er ist nur für Volljährige. Gespeichert wird nur, dass du bestätigt hast — \
+                             nicht dein Geburtsdatum.",
+                        ));
+                        ui.horizontal(|ui| {
+                            ui.label(t("Geburtsdatum"));
+                            ui.add(egui::TextEdit::singleline(&mut self.gen_geburt).hint_text("TT.MM.JJJJ").desired_width(110.0));
+                        });
+                        ui.checkbox(
+                            &mut self.gen_frei_zusage,
+                            t("Ich bin volljährig und erzeuge keine Bilder von echten Personen ohne deren Einwilligung."),
+                        );
+                        let teile: Vec<&str> = self.gen_geburt.trim().split(['.', '-', '/']).collect();
+                        if ui.add_enabled(self.gen_frei_zusage, egui::Button::new(t("Bestätigen"))).clicked() {
+                            let zahl = |i: usize| teile.get(i).and_then(|v| v.trim().parse::<i64>().ok()).unwrap_or(0);
+                            match generator::volljaehrigkeit_bestaetigen(zahl(0) as u32, zahl(1) as u32, zahl(2) as i32) {
+                                Ok(()) => {
+                                    self.gen_frei_bestaetigt = true;
+                                    self.gen_meldung.clear();
+                                }
+                                Err(e) => {
+                                    self.gen_frei = false;
+                                    self.gen_meldung = e;
+                                }
+                            }
+                            self.gen_geburt.clear();
+                        }
+                    });
+                    if !self.gen_meldung.is_empty() {
+                        ui.colored_label(farbe::AKZENT, &self.gen_meldung);
+                    }
+                    return;
+                }
+                if self.gen_frei && !self.gen_frei_installiert {
+                    ui.label(t(
+                        "Für den freien Modus wird einmalig ein eigenes Bildmodell geladen. \
+                         Ein Bild dauert damit rund drei bis vier Minuten.",
+                    ));
+                    if ui
+                        .button(tf("Freies Bildmodell installieren ({} GB)", &[&format!("{:.1}", generator::frei_paketgroesse() as f64 / 1e9)]))
+                        .clicked()
+                    {
+                        self.gen_installieren(true);
+                    }
+                    if !self.gen_meldung.is_empty() {
+                        ui.colored_label(farbe::AKZENT, &self.gen_meldung);
+                    }
+                    return;
+                }
+                if self.gen_frei {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new(t("Gesperrt: alles, was auf Kinder oder Jugendliche zielt."))
+                                .size(11.0)
+                                .color(farbe::TEXT_LEISE),
+                        );
+                        if ui.small_button(t("Bestätigung zurücknehmen")).clicked() {
+                            generator::bestaetigung_zuruecknehmen();
+                            self.gen_frei_bestaetigt = false;
+                            self.gen_frei = false;
+                        }
+                    });
                 }
                 ui.label(t("Was soll zu sehen sein? (Englisch klappt am besten)"));
                 ui.add(
@@ -2185,7 +2371,8 @@ impl App {
                     }
                     if let Some(seit) = self.gen_seit {
                         ui.add(egui::Spinner::new());
-                        ui.label(tf("läuft seit {} s (~1 min)", &[&seit.elapsed().as_secs()]));
+                        let dauer = if self.gen_frei { t("~3–4 min") } else { t("~1 min") };
+                        ui.label(tf("läuft seit {} s ({})", &[&seit.elapsed().as_secs(), &dauer]));
                         ctx.request_repaint_after(std::time::Duration::from_millis(500));
                     }
                 });
@@ -2289,7 +2476,13 @@ impl App {
         let edits: Vec<Option<Edit>> = files
             .iter()
             .map(|f| {
-                if let Some(e) = self.edits.get(f) {
+                // Unbearbeitet und hier nie gemessen (z. B. eben zurueckgesetzt):
+                // keine eigene Bearbeitung — der Worker misst den Grundstand frisch.
+                let eigene = self
+                    .edits
+                    .get(f)
+                    .filter(|e| e.bearbeitet || self.grundstaende.contains_key(f));
+                if let Some(e) = eigene {
                     Some(e.clone())
                 } else if auto {
                     None
@@ -2852,6 +3045,80 @@ fn histogram(rgba: &[u8]) -> [[f32; 64]; 3] {
 
 /// Ein Regler wie in der Web-Version: Beschriftung links, Wert rechts,
 /// Doppelklick setzt zurueck.
+/// Die Reglergruppen der Seitenleiste — jede laesst sich einzeln auf den Stand
+/// beim Import zuruecksetzen.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Gruppe {
+    Grund,
+    Farbkanaele,
+    Farbverlauf,
+    Effekte,
+    Details,
+    Objektiv,
+}
+
+/// Setzt die Felder EINER Gruppe auf den Stand beim Import (`g`). Was zu keiner
+/// Gruppe gehoert (Zuschnitt, Drehung, Retusche, Zusaetze), bleibt — das nimmt
+/// nur das ganze Zuruecksetzen mit.
+fn gruppe_zuruecksetzen(gruppe: Gruppe, e: &mut Edit, g: &Edit) {
+    match gruppe {
+        Gruppe::Grund => {
+            e.profil = g.profil.clone();
+            e.temp = g.temp;
+            e.tint = g.tint;
+            e.base_ev = g.base_ev;
+            e.exposure = g.exposure;
+            e.contrast = g.contrast;
+            e.highlights = g.highlights;
+            e.shadows = g.shadows;
+            e.whites = g.whites;
+            e.blacks = g.blacks;
+            e.texture = g.texture;
+            e.clarity = g.clarity;
+            e.dehaze = g.dehaze;
+            e.vibrance = g.vibrance;
+            e.saturation = g.saturation;
+            e.bw = g.bw;
+            // Die Gradationskurve hat keinen eigenen Regler; Vorlagen setzen
+            // sie zusammen mit dem Ton.
+            e.curve = g.curve;
+        }
+        Gruppe::Farbkanaele => {
+            e.hsl_h = g.hsl_h;
+            e.hsl_s = g.hsl_s;
+            e.hsl_l = g.hsl_l;
+        }
+        Gruppe::Farbverlauf => {
+            e.grade_shadow_hue = g.grade_shadow_hue;
+            e.grade_shadow_sat = g.grade_shadow_sat;
+            e.grade_mid_hue = g.grade_mid_hue;
+            e.grade_mid_sat = g.grade_mid_sat;
+            e.grade_high_hue = g.grade_high_hue;
+            e.grade_high_sat = g.grade_high_sat;
+            e.grade_balance = g.grade_balance;
+        }
+        Gruppe::Effekte => {
+            e.vignette = g.vignette;
+            e.grain = g.grain;
+        }
+        Gruppe::Details => {
+            e.sharpen = g.sharpen;
+            e.sharpen_radius = g.sharpen_radius;
+            e.sharpen_mask = g.sharpen_mask;
+            e.noise = g.noise;
+            e.color_noise = g.color_noise;
+        }
+        Gruppe::Objektiv => {
+            e.lens_auto = g.lens_auto;
+            e.lens_profil = g.lens_profil.clone();
+            e.lens_devignette = g.lens_devignette;
+            e.lens_distort = g.lens_distort;
+            e.straighten = g.straighten;
+            e.blackpoint = g.blackpoint;
+        }
+    }
+}
+
 fn slider(ui: &mut egui::Ui, label: &str, value: &mut f32, min: f32, max: f32, def: f32) -> bool {
     let mut changed = false;
     ui.horizontal(|ui| {
@@ -2865,7 +3132,7 @@ fn slider(ui: &mut egui::Ui, label: &str, value: &mut f32, min: f32, max: f32, d
             *value = def;
             changed = true;
         }
-        resp.on_hover_text(t("Doppelklick setzt zurück"));
+        resp.on_hover_text(t("Doppelklick setzt auf den Stand beim Import zurück"));
         changed |= ui
             .add(egui::Slider::new(value, min..=max).show_value(false))
             .changed();
@@ -3017,6 +3284,7 @@ impl App {
         // System — egui fasst beides als `command`).
         let (mut z, mut zz, mut kop, mut einf, mut auto, mut j, mut w, mut v, mut r, mut vorher, mut d) =
             (false, false, false, false, false, false, false, false, false, false, false);
+        let mut zurueck = false;
         ctx.input(|i| {
             let cmd = i.modifiers.command;
             let shift = i.modifiers.shift;
@@ -3025,6 +3293,7 @@ impl App {
             kop = cmd && shift && i.key_pressed(egui::Key::C);
             einf = cmd && shift && i.key_pressed(egui::Key::V);
             auto = cmd && i.key_pressed(egui::Key::U);
+            zurueck = cmd && shift && i.key_pressed(egui::Key::R);
             if !cmd {
                 j = i.key_pressed(egui::Key::J);
                 w = i.key_pressed(egui::Key::W);
@@ -3048,6 +3317,9 @@ impl App {
         }
         if auto {
             self.auto_anwenden();
+        }
+        if zurueck {
+            self.auswahl_zuruecksetzen();
         }
         if j {
             self.clipping = !self.clipping;
@@ -3075,7 +3347,7 @@ impl App {
         if d {
             self.gallery_view = false;
         }
-        if z || zz || kop || einf || auto {
+        if z || zz || kop || einf || auto || zurueck {
             return;
         }
         ctx.input(|i| {
@@ -3160,6 +3432,17 @@ impl App {
                     .clicked()
                 {
                     self.einstellungen_einfuegen();
+                }
+                let kann_zurueck = self.selected.iter().any(|s| *s)
+                    || self.current_path().is_some_and(|p| {
+                        self.grundstaende.get(&p).is_some_and(|g| self.edits.get(&p) != Some(g))
+                    });
+                if ui
+                    .add_enabled(has && kann_zurueck, egui::Button::new(t("Zurücksetzen")))
+                    .on_hover_text(t("Auf den Stand beim Import zurücksetzen (⇧⌘R) — bei markierten Fotos auf alle"))
+                    .clicked()
+                {
+                    self.auswahl_zuruecksetzen();
                 }
                 ui.separator();
                 // Lokale KI: ohne Installation ein Knopf zum Installieren (ein Klick,
@@ -3426,9 +3709,12 @@ impl App {
             rect
         };
         // Massstab in echten Bildpixeln: „100 %" muss heissen, dass ein Bildpunkt
-        // ein Bildschirmpunkt ist — nicht, dass das Bild eingepasst gezeigt wird.
+        // ein Bildschirmpixel ist — nicht, dass das Bild eingepasst gezeigt wird.
+        // ⚠️ PHYSISCHE Pixel: egui rechnet in Punkten, ein HiDPI-Schirm hat zwei
+        // Pixel je Punkt. In Punkten gerechnet war „1:1" in Wahrheit 200 % —
+        // jedes Originalpixel auf vier Schirmpixel aufgeblasen und weich.
         let massstab = match &self.raw_full {
-            Some(raw) if raw.width > 0 => img_rect.width() / raw.width as f32 * 100.0,
+            Some(raw) if raw.width > 0 => img_rect.width() * ctx.pixels_per_point() / raw.width as f32 * 100.0,
             _ => self.zoom * 100.0,
         };
 
@@ -3578,6 +3864,16 @@ impl App {
                     self.needs_render = true;
                 }
                 vh.on_hover_text(t("gedrückt halten"));
+                let veraendert = self.current_path().is_some_and(|p| {
+                    self.grundstaende.get(&p).is_some_and(|g| self.edits.get(&p) != Some(g))
+                });
+                if ui
+                    .add_enabled(has && veraendert, egui::Button::new(t("Zurücksetzen")))
+                    .on_hover_text(t("Alle Einstellungen dieses Fotos auf den Stand beim Import (⇧⌘R)"))
+                    .clicked()
+                {
+                    self.zuruecksetzen();
+                }
             });
         });
 
@@ -3610,12 +3906,23 @@ impl App {
         if let Some(prev) = self.undo.pop() {
             let now = self.edit_ref();
             self.redo.push(now);
-            if let Some(p) = self.current_path() {
-                self.edits.insert(p, prev);
-            }
-            self.needs_render = true;
-            self.mark_dirty();
+            self.bearbeitung_setzen(prev);
         }
+    }
+
+    /// Ersetzt die Bearbeitung des offenen Fotos (Rueckgaengig, Wiederherstellen,
+    /// Zuruecksetzen). Retusche und Zusaetze stecken in den Pixeln der
+    /// Arbeitskopie — aendern sie sich, muss sie neu aufgebaut werden. Ohne das
+    /// blieb eine rueckgaengig gemachte Retusche im Bild stehen.
+    fn bearbeitung_setzen(&mut self, neu: Edit) {
+        let Some(p) = self.current_path() else { return };
+        let alt = self.edit_ref();
+        if alt.heal != neu.heal || alt.heal_ki != neu.heal_ki || alt.zusaetze != neu.zusaetze {
+            self.needs_reupload = true;
+        }
+        self.edits.insert(p, neu);
+        self.needs_render = true;
+        self.mark_dirty();
     }
 
     /// Wiederherstellen (⇧⌘Z).
@@ -3623,11 +3930,7 @@ impl App {
         if let Some(next) = self.redo.pop() {
             let now = self.edit_ref();
             self.undo.push(now);
-            if let Some(p) = self.current_path() {
-                self.edits.insert(p, next);
-            }
-            self.needs_render = true;
-            self.mark_dirty();
+            self.bearbeitung_setzen(next);
         }
     }
 
@@ -3651,14 +3954,83 @@ impl App {
         self.mark_dirty();
     }
 
-    /// Zurueck zur Grundausstattung des Fotos (Automatik bzw. XMP-Einstellungen).
+    /// Zurueck auf den Stand beim Import (Automatik bzw. XMP-Einstellungen
+    /// eines anderen Programms): alle Regler, Zuschnitt, Drehung, Retusche und
+    /// Zusaetze. Rueckgaengig (⌘Z) bleibt moeglich.
     fn zuruecksetzen(&mut self) {
         let Some(p) = self.current_path() else { return };
         let Some(grund) = self.grundstaende.get(&p).cloned() else { return };
+        if self.edits.get(&p) == Some(&grund) {
+            return;
+        }
         self.push_undo();
-        self.edits.insert(p, grund);
-        self.needs_render = true;
-        self.mark_dirty();
+        self.bearbeitung_setzen(grund);
+        self.status = t("Auf den Stand beim Import zurückgesetzt — ⌘Z holt die Bearbeitung zurück").into();
+    }
+
+    /// Zuruecksetzen fuer alle markierten Fotos (⇧⌘R), sonst fuer das offene.
+    ///
+    /// Fuer Fotos, die in dieser Sitzung noch nicht geladen waren, ist der
+    /// Stand beim Import noch nicht gemessen (dafuer muesste jedes RAW
+    /// dekodiert werden). Sie werden als unbearbeitet gesichert — und eine
+    /// unbearbeitete Begleitdatei folgt beim Laden, Exportieren und im Stapel
+    /// immer dem frisch gemessenen Grundstand (`startwerte_nachziehen`).
+    /// Sterne bleiben.
+    fn auswahl_zuruecksetzen(&mut self) {
+        let markiert: Vec<PathBuf> = self
+            .gallery
+            .iter()
+            .zip(self.selected.iter())
+            .filter(|(_, s)| **s)
+            .map(|(p, _)| p.clone())
+            .collect();
+        if markiert.is_empty() {
+            self.zuruecksetzen();
+            return;
+        }
+        let aktuell = self.current_path();
+        let mut anzahl = 0usize;
+        for p in &markiert {
+            if Some(p) == aktuell.as_ref() {
+                if self.grundstaende.contains_key(p) && self.edits.get(p) != self.grundstaende.get(p) {
+                    self.zuruecksetzen();
+                    anzahl += 1;
+                }
+                continue;
+            }
+            let neu = if let Some(g) = self.grundstaende.get(p) {
+                g.clone()
+            } else {
+                let Some(mut e) = self.edits.get(p).cloned().or_else(|| load_sidecar(p).map(|(e, _)| e)) else {
+                    continue; // keine Begleitdatei: steht schon auf dem Import
+                };
+                if !e.bearbeitet && e.prozess >= pipeline::params::PROZESS {
+                    continue;
+                }
+                e.bearbeitet = false;
+                e.prozess = pipeline::params::PROZESS;
+                e
+            };
+            if self.edits.get(p) == Some(&neu) {
+                continue;
+            }
+            // Sterne nie verlieren — auch wenn sie noch nicht eingelesen sind.
+            let sterne = self
+                .stars
+                .get(p)
+                .copied()
+                .or_else(|| load_sidecar(p).map(|(_, s)| s))
+                .unwrap_or(0);
+            save_sidecar(p, &neu, sterne);
+            self.hat_sidecar.insert(p.clone());
+            self.edits.insert(p.clone(), neu);
+            // Die Miniatur zeigte den bearbeiteten Stand — neu aufbauen lassen.
+            let _ = std::fs::remove_file(thumb_cache_path(p));
+            self.thumbs.remove(p);
+            anzahl += 1;
+        }
+        self.status = tf("{} Foto(s) auf den Stand beim Import zurückgesetzt", &[&anzahl]);
+        self.zaehler_auffrischen();
     }
 
     /// Weissabgleich aus einer Flaeche des Fotos (Anteile im Sensorbild):
@@ -4030,16 +4402,55 @@ impl App {
         let mut changed = false;
         let mut started = false;
         let mut e = self.edit_ref();
+        // Stand beim Import: Ziel von Doppelklick, Gruppen-Knopf und Zuruecksetzen.
+        // Solange das Foto noch laedt, gibt es ihn nicht — dann bleibt alles, wie es ist.
+        let g = self
+            .current_path()
+            .and_then(|p| self.grundstaende.get(&p).cloned())
+            .unwrap_or_else(|| e.clone());
+        let mut gruppe_zurueck = false;
 
         // Die Kennung haelt den Auf-/Zu-Zustand fest; sie bleibt deutsch, damit
-        // ein Sprachwechsel keine Gruppe auf- oder zuklappt.
+        // ein Sprachwechsel keine Gruppe auf- oder zuklappt. Im Kopf setzt
+        // ↺ die Gruppe auf den Stand beim Import — sichtbar nur, wenn dort etwas
+        // verstellt ist.
         macro_rules! group {
-            ($kennung:literal, $title:expr, $body:expr) => {
-                egui::CollapsingHeader::new($title)
-                    .id_salt($kennung)
-                    .default_open(true)
-                    .show(ui, $body);
-            };
+            ($kennung:literal, $title:expr, $gruppe:expr, $body:expr) => {{
+                let verstellt = {
+                    let mut probe = e.clone();
+                    gruppe_zuruecksetzen($gruppe, &mut probe, &g);
+                    probe != e
+                };
+                let (mut auf_zu, mut zurueck) = (false, false);
+                let mut kopf = egui::collapsing_header::CollapsingState::load_with_default_open(
+                    ui.ctx(),
+                    ui.make_persistent_id($kennung),
+                    true,
+                )
+                .show_header(ui, |ui| {
+                    auf_zu = ui
+                        .add(egui::Label::new(egui::RichText::new($title).strong()).sense(egui::Sense::click()))
+                        .clicked();
+                    // Direkt hinter dem Namen, nicht am rechten Rand: dort liegt
+                    // der schwebende Scrollbalken und faengt den Klick ab
+                    // (am Pruefstand gesehen).
+                    if verstellt {
+                        zurueck = ui
+                            .add(egui::Button::new(egui::RichText::new("↺").size(13.0)).frame(false))
+                            .on_hover_text(t("Diese Gruppe auf den Stand beim Import zurücksetzen"))
+                            .clicked();
+                    }
+                });
+                if auf_zu {
+                    kopf.toggle();
+                }
+                kopf.body($body);
+                if zurueck {
+                    gruppe_zuruecksetzen($gruppe, &mut e, &g);
+                    changed = true;
+                    gruppe_zurueck = true;
+                }
+            }};
         }
 
         let info = grundpanel::FotoInfo {
@@ -4053,8 +4464,8 @@ impl App {
         };
         let mut aktionen = grundpanel::Aktionen::default();
         let pipette = self.pipette;
-        group!("Grundeinstellungen", t("Grundeinstellungen"), |ui: &mut egui::Ui| {
-            aktionen = grundpanel::grundeinstellungen(ui, &mut e, &info, pipette);
+        group!("Grundeinstellungen", t("Grundeinstellungen"), Gruppe::Grund, |ui: &mut egui::Ui| {
+            aktionen = grundpanel::grundeinstellungen(ui, &mut e, &g, &info, pipette);
         });
         changed |= aktionen.geaendert;
         // Farbkanaele: drei Regler Rot/Gruen/Blau, jeweils 0–100 %. 50 % laesst die
@@ -4070,7 +4481,7 @@ impl App {
         // Die KI schreibt weiterhin fein aufgeloest in alle acht Baender; diese
         // Regler zeigen den staerksten Wert ihrer Gruppe und setzen beim Ziehen die
         // ganze Gruppe gemeinsam.
-        group!("Farbkanäle", t("Farbkanäle"), |ui: &mut egui::Ui| {
+        group!("Farbkanäle", t("Farbkanäle"), Gruppe::Farbkanaele, |ui: &mut egui::Ui| {
             // Name → interne Bandindizes (0=Rot,1=Orange,2=Gelb,3=Grün,4=Cyan,
             // 5=Blau,6=Violett,7=Magenta). Zusammen decken die drei Gruppen den
             // ganzen Farbkreis lückenlos ab.
@@ -4086,12 +4497,15 @@ impl App {
             );
             for (name, baender) in gruppen {
                 // Reglerstand aus dem betragsgroessten Band der Gruppe ableiten.
-                let ist = baender
-                    .iter()
-                    .map(|&b| e.hsl_s[b])
-                    .fold(0.0, |a, v| if v.abs() > f32::abs(a) { v } else { a });
-                let mut wert = ist / 2.0 + 50.0; // −100..100  →  0..100
-                if slider(ui, name, &mut wert, 0.0, 100.0, 50.0) {
+                let staerkstes = |hsl: &[f32; 8]| {
+                    baender
+                        .iter()
+                        .map(|&b| hsl[b])
+                        .fold(0.0, |a, v| if v.abs() > f32::abs(a) { v } else { a })
+                };
+                let mut wert = staerkstes(&e.hsl_s) / 2.0 + 50.0; // −100..100  →  0..100
+                let import = staerkstes(&g.hsl_s) / 2.0 + 50.0;
+                if slider(ui, name, &mut wert, 0.0, 100.0, import) {
                     let s = (wert - 50.0) * 2.0; // 0..100  →  −100..100
                     for &b in baender {
                         e.hsl_s[b] = s;
@@ -4100,27 +4514,27 @@ impl App {
                 }
             }
         });
-        group!("Farbverlauf (Split-Toning)", t("Farbverlauf (Split-Toning)"), |ui: &mut egui::Ui| {
-            changed |= slider(ui, t("Tiefen · Ton"), &mut e.grade_shadow_hue, 0.0, 360.0, 0.0);
-            changed |= slider(ui, t("Tiefen · Sätt."), &mut e.grade_shadow_sat, 0.0, 100.0, 0.0);
-            changed |= slider(ui, t("Mitten · Ton"), &mut e.grade_mid_hue, 0.0, 360.0, 0.0);
-            changed |= slider(ui, t("Mitten · Sätt."), &mut e.grade_mid_sat, 0.0, 100.0, 0.0);
-            changed |= slider(ui, t("Lichter · Ton"), &mut e.grade_high_hue, 0.0, 360.0, 0.0);
-            changed |= slider(ui, t("Lichter · Sätt."), &mut e.grade_high_sat, 0.0, 100.0, 0.0);
-            changed |= slider(ui, t("Balance"), &mut e.grade_balance, -100.0, 100.0, 0.0);
+        group!("Farbverlauf (Split-Toning)", t("Farbverlauf (Split-Toning)"), Gruppe::Farbverlauf, |ui: &mut egui::Ui| {
+            changed |= slider(ui, t("Tiefen · Ton"), &mut e.grade_shadow_hue, 0.0, 360.0, g.grade_shadow_hue);
+            changed |= slider(ui, t("Tiefen · Sätt."), &mut e.grade_shadow_sat, 0.0, 100.0, g.grade_shadow_sat);
+            changed |= slider(ui, t("Mitten · Ton"), &mut e.grade_mid_hue, 0.0, 360.0, g.grade_mid_hue);
+            changed |= slider(ui, t("Mitten · Sätt."), &mut e.grade_mid_sat, 0.0, 100.0, g.grade_mid_sat);
+            changed |= slider(ui, t("Lichter · Ton"), &mut e.grade_high_hue, 0.0, 360.0, g.grade_high_hue);
+            changed |= slider(ui, t("Lichter · Sätt."), &mut e.grade_high_sat, 0.0, 100.0, g.grade_high_sat);
+            changed |= slider(ui, t("Balance"), &mut e.grade_balance, -100.0, 100.0, g.grade_balance);
         });
-        group!("Effekte", t("Effekte"), |ui: &mut egui::Ui| {
-            changed |= slider(ui, t("Vignette"), &mut e.vignette, -100.0, 100.0, 0.0);
-            changed |= slider(ui, t("Körnung"), &mut e.grain, 0.0, 100.0, 0.0);
+        group!("Effekte", t("Effekte"), Gruppe::Effekte, |ui: &mut egui::Ui| {
+            changed |= slider(ui, t("Vignette"), &mut e.vignette, -100.0, 100.0, g.vignette);
+            changed |= slider(ui, t("Körnung"), &mut e.grain, 0.0, 100.0, g.grain);
         });
-        group!("Details", t("Details"), |ui: &mut egui::Ui| {
-            changed |= slider(ui, t("Schärfen"), &mut e.sharpen, 0.0, 100.0, 0.0);
-            changed |= slider(ui, t("Radius"), &mut e.sharpen_radius, 0.0, 100.0, 0.0);
-            changed |= slider(ui, t("Maskierung"), &mut e.sharpen_mask, 0.0, 100.0, 0.0);
-            changed |= slider(ui, t("Rauschen · Helligkeit"), &mut e.noise, 0.0, 100.0, 0.0);
-            changed |= slider(ui, t("Rauschen · Farbe"), &mut e.color_noise, 0.0, 100.0, 0.0);
+        group!("Details", t("Details"), Gruppe::Details, |ui: &mut egui::Ui| {
+            changed |= slider(ui, t("Schärfen"), &mut e.sharpen, 0.0, 100.0, g.sharpen);
+            changed |= slider(ui, t("Radius"), &mut e.sharpen_radius, 0.0, 100.0, g.sharpen_radius);
+            changed |= slider(ui, t("Maskierung"), &mut e.sharpen_mask, 0.0, 100.0, g.sharpen_mask);
+            changed |= slider(ui, t("Rauschen · Helligkeit"), &mut e.noise, 0.0, 100.0, g.noise);
+            changed |= slider(ui, t("Rauschen · Farbe"), &mut e.color_noise, 0.0, 100.0, g.color_noise);
         });
-        group!("Objektiv & Geometrie", t("Objektiv & Geometrie"), |ui: &mut egui::Ui| {
+        group!("Objektiv & Geometrie", t("Objektiv & Geometrie"), Gruppe::Objektiv, |ui: &mut egui::Ui| {
             // Profilkorrektur: Verzeichnung aus dem Objektivprofil plus die am
             // Bild gemessene Randabdunklung — an, solange niemand sie abschaltet
             // (wie die Referenz-Entwicklung bei RAF-Kameras). Die Regler darunter
@@ -4184,12 +4598,12 @@ impl App {
                 };
                 ui.label(egui::RichText::new(text).size(10.0).color(farbe::TEXT_LEISE));
             }
-            changed |= slider(ui, t("Vignette entfernen"), &mut e.lens_devignette, 0.0, 100.0, 0.0);
+            changed |= slider(ui, t("Vignette entfernen"), &mut e.lens_devignette, 0.0, 100.0, g.lens_devignette);
             // Positiv = Tonne beheben (gerade Linien woelben sich nach aussen),
             // negativ = Kissen beheben. Wirkt im zweiten Durchgang beim Abtasten.
-            changed |= slider(ui, t("Verzeichnung"), &mut e.lens_distort, -100.0, 100.0, 0.0);
-            changed |= slider(ui, t("Geraderichten"), &mut e.straighten, -15.0, 15.0, 0.0);
-            changed |= slider(ui, t("Grauschleier"), &mut e.blackpoint, 0.0, 100.0, 0.0);
+            changed |= slider(ui, t("Verzeichnung"), &mut e.lens_distort, -100.0, 100.0, g.lens_distort);
+            changed |= slider(ui, t("Geraderichten"), &mut e.straighten, -15.0, 15.0, g.straighten);
+            changed |= slider(ui, t("Grauschleier"), &mut e.blackpoint, 0.0, 100.0, g.blackpoint);
         });
 
         // Wurde irgendein Regler bewegt? egui meldet das ueber den Kontext.
@@ -4199,7 +4613,14 @@ impl App {
         }
         let now = self.edit_ref();
         if now != e {
-            e.bearbeitet = true;
+            // Wieder genau auf dem Stand beim Import (Regler zurueckgezogen,
+            // Gruppe zurueckgesetzt) = unbearbeitet; der Filter „Bearbeitet"
+            // und die Markierung in der Galerie sollen das sehen.
+            e.bearbeitet = {
+                let mut ohne = e.clone();
+                ohne.bearbeitet = g.bearbeitet;
+                ohne != g
+            };
             // EIN Rueckgaengig-Schritt je Reglerzug (vorher: einer je Bild des
             // Zugs — „Zurueck" ging dann nur ein paar Pixel zurueck).
             if !self.zug_laeuft && self.undo.last() != Some(&now) {
@@ -4223,7 +4644,10 @@ impl App {
         if !gedrueckt {
             self.zug_laeuft = false;
         }
-        if aktionen.geaendert {
+        // Jede Reglerbewegung sichern — nicht nur die der Grundeinstellungen:
+        // Details, Effekte, Objektiv und Co. landeten sonst erst beim
+        // Fotowechsel in der Begleitdatei.
+        if aktionen.geaendert || changed || gruppe_zurueck {
             self.mark_dirty();
         }
         if aktionen.pipette_umschalten {
@@ -4623,7 +5047,21 @@ impl App {
             // Nachgeladener Ausschnitt in echter Aufloesung — an seiner Stelle,
             // nicht ueber das ganze Bild gezogen.
             if let Some(dt) = self.detail_tex.clone() {
-                if let Some(dr) = self.detail_rect_am_schirm(img_rect) {
+                if let Some(mut dr) = self.detail_rect_am_schirm(img_rect) {
+                    // Ein Ausschnitt in Schirmaufloesung liegt genau auf dem
+                    // Pixelraster: eine Textur-Zelle = ein Bildschirmpixel, ohne
+                    // Nachrechnen beim Zeichnen.
+                    // Nur wenn die Groesse stimmt — nach einer Fenster-
+                    // aenderung bis zum Nachladen lieber weich als verschoben.
+                    let ppp = ctx.pixels_per_point();
+                    let [tw, th] = dt.size();
+                    let gleich = (dr.width() * ppp - tw as f32).abs() <= 1.0
+                        && (dr.height() * ppp - th as f32).abs() <= 1.0;
+                    // Gilt auch fuer 1:1: genau ein Originalpixel je Schirmpixel.
+                    if gleich {
+                        let ecke = (dr.min.to_vec2() * ppp).round() / ppp;
+                        dr = egui::Rect::from_min_size(ecke.to_pos2(), egui::vec2(tw as f32, th as f32) / ppp);
+                    }
                     painter.image(dt.id(), dr, uv_ganz, egui::Color32::WHITE);
                 }
             }
@@ -4768,12 +5206,19 @@ impl App {
 
         // Lohnt es sich ueberhaupt? Kriterium: zeigt der Bildschirm gerade mehr
         // Pixel je Quellpixel, als die verkleinerte Arbeitskopie hergibt?
+        //
+        // ⚠️ In PHYSISCHEN Pixeln: egui misst in Punkten, ein HiDPI-Schirm
+        // zeigt zwei Pixel je Punkt. Hier stand `vis.width()` allein — die
+        // eingepasste Ansicht blieb deshalb auf jedem HiDPI-Schirm die
+        // aufgeblasene Arbeitskopie (1938 px auf rund 2500–3800 Schirmpixeln),
+        // und jedes Foto sah weich aus.
         let quell_breite = ((sx1 - sx0) * raw.width as f32).max(1.0);
-        let am_schirm = vis.width() / quell_breite;
+        let am_schirm = vis.width() * ctx.pixels_per_point() / quell_breite;
         let in_vorschau = prev.width as f32 / raw.width as f32;
         if am_schirm <= in_vorschau * 1.05 {
             if self.detail.is_some() {
                 self.detail = None;
+                self.detail_quelle = None;
                 self.detail_tex = None;
                 self.detail_rect = None;
             }
@@ -4796,15 +5241,56 @@ impl App {
         if want.2 < 8 || want.3 < 8 {
             return;
         }
-        // Nur neu laden, wenn sich der Ausschnitt spuerbar verschoben hat.
-        if let Some(have) = self.detail_rect {
-            let moved = (have.0 as i64 - want.0 as i64).abs()
-                + (have.1 as i64 - want.1 as i64).abs();
-            let resized = (have.2 as i64 - want.2 as i64).abs()
-                + (have.3 as i64 - want.3 as i64).abs();
-            if moved < 64 && resized < 64 {
+        // Zeigt der Schirm weniger Pixel als das Original hat (eingepasst,
+        // leicht gezoomt), wird der Ausschnitt GENAU in Schirmpixeln gerechnet:
+        // jede Textur-Zelle auf genau ein Bildschirmpixel. Schon ein Faktor
+        // 0,975 beim Zeichnen (bilinear, krumme Lage) kostete gemessen ein
+        // Viertel der Feinzeichnung.
+        let ppp = ctx.pixels_per_point();
+        let Some(dr) = self.schirm_rect_fuer(img_rect, want) else { return };
+        let quer = matches!(edit.rotate.rem_euclid(360), 90 | 270);
+        let (sb, sh) = if quer { (dr.height(), dr.width()) } else { (dr.width(), dr.height()) };
+        let schirm = ((sb * ppp).round() as u32, (sh * ppp).round() as u32);
+        let ziel = if schirm.0 < want.2 && schirm.1 < want.3 {
+            (schirm.0.max(8), schirm.1.max(8))
+        } else {
+            (want.2, want.3)
+        };
+        let massstab = ziel.0 as f32 / want.2 as f32;
+
+        let nah = |a: (u32, u32, u32, u32), b: (u32, u32, u32, u32)| {
+            let moved = (a.0 as i64 - b.0 as i64).abs() + (a.1 as i64 - b.1 as i64).abs();
+            let resized = (a.2 as i64 - b.2 as i64).abs() + (a.3 as i64 - b.3 as i64).abs();
+            moved < 64 && resized < 64
+        };
+        // Derselbe Ausschnitt in derselben Groesse? Ein Bildschirm-Ausschnitt
+        // muss pixelgenau passen (Fenster- oder Leistengroesse geaendert =
+        // neu laden), ein Original-Ausschnitt nur ungefaehr.
+        let passt = |q: (u32, u32, u32, u32, u32, u32)| {
+            nah((q.0, q.1, q.2, q.3), want)
+                && if massstab < 1.0 {
+                    q.4.abs_diff(ziel.0) <= 1 && q.5.abs_diff(ziel.1) <= 1
+                } else {
+                    q.4 == q.2
+                }
+        };
+        // Steht die Textur schon fuer diesen Ausschnitt? Dann nichts zu tun.
+        if self.detail_tex.is_some() && self.detail_rect.is_some() && self.detail_quelle.is_some_and(passt) {
+            return;
+        }
+        // Derselbe Ausschnitt ist schon auf der Grafikkarte, nur die Regler
+        // haben sich geaendert: neu rechnen, nicht neu laden. Waehrend ein
+        // Regler gezogen wird, zeigt die eingepasste Ansicht die schnelle
+        // Arbeitskopie — der Bildschirm-Ausschnitt kostet je Zug ein
+        // Vielfaches und kommt beim Loslassen.
+        if self.detail.is_some() && self.detail_quelle.is_some_and(passt) {
+            if massstab < 1.0 && self.zug_laeuft {
+                // Nach dem Loslassen sicher noch einmal zeichnen.
+                ctx.request_repaint_after(std::time::Duration::from_millis(60));
                 return;
             }
+            self.detail_neu_rechnen(ctx);
+            return;
         }
         // Retusche auch im Zoom: sonst waere ausgerechnet beim genauen Hinsehen
         // die Stelle wieder da, die man weggemacht hat.
@@ -4829,33 +5315,63 @@ impl App {
             .map(|z| z.im_ausschnitt(raw.width, raw.height, want.0, want.1, want.2, want.3))
             .collect();
         let retusche = pipeline::Retusche { heal: &heal_lokal, heal_ki: &heal_ki_lokal, zusaetze: &stuecke_lokal };
-        if let Ok(mut region) = GpuImage::upload_region_mit(gpu, raw, want.0, want.1, want.2, want.3, &retusche)
-        {
-            // Der Ausschnitt muss im VOLLEN Bildbezug entzerren — kachel-lokal
-            // gerechnet spraenge er gegenueber der Vorschau.
-            region.als_ausschnitt(want.0, want.1, raw.width, raw.height, prev.objektiv);
+        let geladen = if massstab >= 1.0 {
+            GpuImage::upload_region_mit(gpu, raw, want.0, want.1, want.2, want.3, &retusche).map(|mut r| {
+                // Der Ausschnitt muss im VOLLEN Bildbezug entzerren — kachel-lokal
+                // gerechnet spraenge er gegenueber der Vorschau.
+                r.als_ausschnitt(want.0, want.1, raw.width, raw.height, prev.objektiv);
+                r
+            })
+        } else {
+            GpuImage::upload_region_verkleinert(gpu, raw, want.0, want.1, want.2, want.3, ziel.0, ziel.1, &retusche)
+                .map(|mut r| {
+                    // Lage und Bildgroesse in Pixeln dieser Aufloesung.
+                    let f = ziel.0 as f32 / want.2 as f32;
+                    r.als_ausschnitt_skaliert(
+                        want.0 as f32 * f,
+                        want.1 as f32 * f,
+                        raw.width as f32 * f,
+                        raw.height as f32 * f,
+                        prev.objektiv,
+                    );
+                    r
+                })
+        };
+        if let Ok(mut region) = geladen {
             // Dieselbe Basisebene wie die Vorschau — aus dem Ausschnitt allein
             // liesse sich die Umgebungshelligkeit am Rand nicht bestimmen.
             region.basis_von(prev);
-            let voll = self.edit_ref();
-            let rgba = region.render_screen(gpu, &voll);
-            // Gleiche Drehung wie die Vorschau — sonst liegt der Ausschnitt quer
-            // im ansonsten aufrechten Bild.
-            let (rgba, rw, rh) = pipeline::ausrichten(
-                &rgba,
-                region.width,
-                region.height,
-                4,
-                edit.rotate,
-                edit.flip_h,
-                edit.flip_v,
-            );
-            let color =
-                egui::ColorImage::from_rgba_unmultiplied([rw as usize, rh as usize], &rgba);
-            self.detail_tex = Some(ctx.load_texture("detail", color, egui::TextureOptions::LINEAR));
-            self.detail_rect = Some(want);
             self.detail = Some(region);
+            self.detail_quelle = Some((want.0, want.1, want.2, want.3, ziel.0, ziel.1));
+            self.detail_neu_rechnen(ctx);
         }
+    }
+
+    /// Rechnet den geladenen Ausschnitt mit dem gezeigten Stand (Regler, oder
+    /// „Vorher") und legt ihn als Textur ab.
+    fn detail_neu_rechnen(&mut self, ctx: &egui::Context) {
+        let (Some(gpu), Some(region), Some(q)) = (&self.gpu, &self.detail, self.detail_quelle) else {
+            return;
+        };
+        let gezeigt = self.gezeigte_bearbeitung();
+        let mut rgba = region.render_screen(gpu, &gezeigt);
+        // Die Clipping-Anzeige (J) gehoert auch in den Ausschnitt — er deckt
+        // in der eingepassten Ansicht das ganze Bild ab.
+        clipping_markieren(&mut rgba, self.clipping && !self.show_before);
+        // Gleiche Drehung wie die Vorschau — sonst liegt der Ausschnitt quer
+        // im ansonsten aufrechten Bild.
+        let (rgba, rw, rh) = pipeline::ausrichten(
+            &rgba,
+            region.width,
+            region.height,
+            4,
+            gezeigt.rotate,
+            gezeigt.flip_h,
+            gezeigt.flip_v,
+        );
+        let color = egui::ColorImage::from_rgba_unmultiplied([rw as usize, rh as usize], &rgba);
+        self.detail_tex = Some(ctx.load_texture("detail", color, egui::TextureOptions::LINEAR));
+        self.detail_rect = Some((q.0, q.1, q.2, q.3));
     }
 
     /// Wo der nachgeladene Ausschnitt auf dem Bildschirm liegt.
@@ -4864,7 +5380,12 @@ impl App {
     /// starkem Zoom ist das um ein Vielfaches zu gross, der Ausschnitt sass also
     /// voellig falsch. Jetzt wird seine Lage zurueckgerechnet.
     fn detail_rect_am_schirm(&self, img_rect: egui::Rect) -> Option<egui::Rect> {
-        let (raw, (x0, y0, w, h)) = (self.raw_full.as_ref()?, self.detail_rect?);
+        self.schirm_rect_fuer(img_rect, self.detail_rect?)
+    }
+
+    /// Wo ein Sensorbereich (x, y, b, h) auf dem Bildschirm liegt.
+    fn schirm_rect_fuer(&self, img_rect: egui::Rect, (x0, y0, w, h): (u32, u32, u32, u32)) -> Option<egui::Rect> {
+        let raw = self.raw_full.as_ref()?;
         let e = self.anzeige_edit();
         let a = (x0 as f32 / raw.width as f32, y0 as f32 / raw.height as f32);
         let b = (

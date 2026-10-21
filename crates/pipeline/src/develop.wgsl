@@ -441,18 +441,50 @@ fn quelle_gruen(p_aus: vec2<f32>) -> vec2<f32> {
     return d + mitte;
 }
 
-// Bilinear aus der Quelltextur, Position in Pixeln der Textur (Mitte = +0,5).
-fn quelle_bilinear(q: vec2<f32>) -> vec3<f32> {
+// Lanczos-3 aus der Quelltextur, Position in Pixeln der Textur (Mitte = +0,5).
+//
+// Frueher bilinear — und das kostete bei JEDEM entzerrten Foto (Objektiv-
+// korrektur ist bei RAF immer an) sichtbar Schaerfe: an einem halben Pixel
+// Versatz laesst lineare Interpolation 0,25 Zyklen/Pixel nur noch mit 71 %
+// durch. Gemessen an DSCF1489 gegen die Referenz-Entwicklung: 0,79–0,88 der
+// Feinzeichnung, ohne Entzerrung 1,0. Lanczos-3 haelt das Band bis ~0,4
+// Zyklen/Pixel nahezu verlustfrei.
+fn lanczos3(x: f32) -> f32 {
+    let a = abs(x);
+    if (a < 1e-5) { return 1.0; }
+    if (a >= 3.0) { return 0.0; }
+    let pi_x = 3.14159265 * x;
+    return 3.0 * sin(pi_x) * sin(pi_x / 3.0) / (pi_x * pi_x);
+}
+
+fn quelle_abtasten(q: vec2<f32>) -> vec3<f32> {
     let dims = vec2<i32>(textureDimensions(src));
     let p = q - 0.5;
+    let basis = vec2<i32>(i32(floor(p.x)), i32(floor(p.y)));
     let f = p - floor(p);
-    let i0 = clamp(vec2<i32>(i32(floor(p.x)), i32(floor(p.y))), vec2<i32>(0, 0), dims - vec2<i32>(1, 1));
-    let i1 = clamp(i0 + vec2<i32>(1, 1), vec2<i32>(0, 0), dims - vec2<i32>(1, 1));
-    let a = textureLoad(src, i0, 0).rgb;
-    let b = textureLoad(src, vec2<i32>(i1.x, i0.y), 0).rgb;
-    let c = textureLoad(src, vec2<i32>(i0.x, i1.y), 0).rgb;
-    let d = textureLoad(src, i1, 0).rgb;
-    return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+    var wx: array<f32, 6>;
+    var wy: array<f32, 6>;
+    var sx = 0.0;
+    var sy = 0.0;
+    for (var i = 0; i < 6; i = i + 1) {
+        wx[i] = lanczos3(f32(i - 2) - f.x);
+        wy[i] = lanczos3(f32(i - 2) - f.y);
+        sx = sx + wx[i];
+        sy = sy + wy[i];
+    }
+    var acc = vec3<f32>(0.0);
+    for (var j = 0; j < 6; j = j + 1) {
+        let yy = clamp(basis.y + j - 2, 0, dims.y - 1);
+        var zeile = vec3<f32>(0.0);
+        for (var i = 0; i < 6; i = i + 1) {
+            let xx = clamp(basis.x + i - 2, 0, dims.x - 1);
+            zeile = zeile + textureLoad(src, vec2<i32>(xx, yy), 0).rgb * wx[i];
+        }
+        acc = acc + zeile * wy[j];
+    }
+    // Die Ueberschwinger eines Kerns mit negativen Keulen duerfen keine
+    // negative Lichtmenge erzeugen.
+    return max(acc / (sx * sy), vec3<f32>(0.0));
 }
 
 fn rampe(x: f32, schw: f32) -> f32 {
@@ -490,9 +522,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             q_b = mitte + (q_g - mitte) * (1.0 + stuetz(u.r_quelle, u.r_ca_b, n, rq));
         }
         cam = vec3<f32>(
-            quelle_bilinear(q_r - u.lage.xy).r,
-            quelle_bilinear(q_g - u.lage.xy).g,
-            quelle_bilinear(q_b - u.lage.xy).b
+            quelle_abtasten(q_r - u.lage.xy).r,
+            quelle_abtasten(q_g - u.lage.xy).g,
+            quelle_abtasten(q_b - u.lage.xy).b
         );
         p_quelle = q_g / u.lage.zw;
     } else {

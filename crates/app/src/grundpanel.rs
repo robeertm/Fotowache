@@ -117,7 +117,7 @@ fn regler_mit_anzeige(
             *value = def;
             changed = true;
         }
-        resp.on_hover_text(t("Doppelklick setzt zurück"));
+        resp.on_hover_text(t("Doppelklick setzt auf den Stand beim Import zurück"));
         // Platz lassen fuer die Wertanzeige (58) samt Abstand davor und
         // danach — sonst ist die Zeile ein paar Punkte breiter als das Feld,
         // und das Reglerfeld waechst mit jedem gezeichneten Bild weiter, bis
@@ -132,7 +132,10 @@ fn regler_mit_anzeige(
     changed
 }
 
-pub fn grundeinstellungen(ui: &mut egui::Ui, e: &mut Edit, info: &FotoInfo, pipette_aktiv: bool) -> Aktionen {
+/// `g` ist der Stand beim Import (Automatik bzw. XMP-Einstellungen): auf ihn
+/// setzt ein Doppelklick einen Regler zurueck, und an ihm misst die Anzeige,
+/// was verstellt ist.
+pub fn grundeinstellungen(ui: &mut egui::Ui, e: &mut Edit, g: &Edit, info: &FotoInfo, pipette_aktiv: bool) -> Aktionen {
     let mut a = Aktionen::default();
 
     // --- Kopf: Auto / Zuruecksetzen ------------------------------------------
@@ -146,7 +149,7 @@ pub fn grundeinstellungen(ui: &mut egui::Ui, e: &mut Edit, info: &FotoInfo, pipe
         }
         if ui
             .button(t("Zurücksetzen"))
-            .on_hover_text(t("Zurück zur Grundausstattung dieses Fotos"))
+            .on_hover_text(t("Alle Einstellungen dieses Fotos auf den Stand beim Import (⇧⌘R)"))
             .clicked()
         {
             a.zuruecksetzen = true;
@@ -237,7 +240,7 @@ pub fn grundeinstellungen(ui: &mut egui::Ui, e: &mut Edit, info: &FotoInfo, pipe
         &mut e.temp,
         -250.0,
         250.0,
-        0.0,
+        g.temp,
         format!("{:.0} K", k_jetzt),
     );
     a.geaendert |= regler_mit_anzeige(
@@ -246,7 +249,7 @@ pub fn grundeinstellungen(ui: &mut egui::Ui, e: &mut Edit, info: &FotoInfo, pipe
         &mut e.tint,
         -150.0,
         150.0,
-        0.0,
+        g.tint,
         mit_vorzeichen(t_jetzt as f32, 0),
     );
 
@@ -256,30 +259,31 @@ pub fn grundeinstellungen(ui: &mut egui::Ui, e: &mut Edit, info: &FotoInfo, pipe
     let mut gesamt = e.base_ev + e.exposure / 50.0;
     let alt = gesamt;
     let anzeige = mit_vorzeichen(gesamt, 2);
-    if regler_mit_anzeige(ui, t("Belichtung"), &mut gesamt, -5.0, 5.0, e.base_ev, anzeige) {
+    let gesamt_import = g.base_ev + g.exposure / 50.0;
+    if regler_mit_anzeige(ui, t("Belichtung"), &mut gesamt, -5.0, 5.0, gesamt_import, anzeige) {
         e.exposure = ((gesamt - e.base_ev) * 50.0 * 100.0).round() / 100.0;
         a.geaendert |= (gesamt - alt).abs() > 1e-6;
     }
-    let ton = |ui: &mut egui::Ui, name: &str, v: &mut f32| {
+    let ton = |ui: &mut egui::Ui, name: &str, v: &mut f32, import: f32| {
         let w = mit_vorzeichen(*v, 0);
-        regler_mit_anzeige(ui, name, v, -100.0, 100.0, 0.0, w)
+        regler_mit_anzeige(ui, name, v, -100.0, 100.0, import, w)
     };
-    a.geaendert |= ton(ui, t("Kontrast"), &mut e.contrast);
-    a.geaendert |= ton(ui, t("Lichter"), &mut e.highlights);
-    a.geaendert |= ton(ui, t("Tiefen"), &mut e.shadows);
-    a.geaendert |= ton(ui, t("Weiß"), &mut e.whites);
-    a.geaendert |= ton(ui, t("Schwarz"), &mut e.blacks);
+    a.geaendert |= ton(ui, t("Kontrast"), &mut e.contrast, g.contrast);
+    a.geaendert |= ton(ui, t("Lichter"), &mut e.highlights, g.highlights);
+    a.geaendert |= ton(ui, t("Tiefen"), &mut e.shadows, g.shadows);
+    a.geaendert |= ton(ui, t("Weiß"), &mut e.whites, g.whites);
+    a.geaendert |= ton(ui, t("Schwarz"), &mut e.blacks, g.blacks);
     ui.add_space(4.0);
-    a.geaendert |= ton(ui, t("Struktur"), &mut e.texture);
-    a.geaendert |= ton(ui, t("Klarheit"), &mut e.clarity);
-    a.geaendert |= ton(ui, t("Dunst entf."), &mut e.dehaze);
-    a.geaendert |= ton(ui, t("Dynamik"), &mut e.vibrance);
-    a.geaendert |= ton(ui, t("Sättigung"), &mut e.saturation);
+    a.geaendert |= ton(ui, t("Struktur"), &mut e.texture, g.texture);
+    a.geaendert |= ton(ui, t("Klarheit"), &mut e.clarity, g.clarity);
+    a.geaendert |= ton(ui, t("Dunst entf."), &mut e.dehaze, g.dehaze);
+    a.geaendert |= ton(ui, t("Dynamik"), &mut e.vibrance, g.vibrance);
+    a.geaendert |= ton(ui, t("Sättigung"), &mut e.saturation, g.saturation);
     let bw = e.bw;
     ui.checkbox(&mut e.bw, t("Schwarzweiß (V)"));
     a.geaendert |= e.bw != bw;
     ui.label(
-        egui::RichText::new(t("Doppelklick auf einen Namen setzt den Regler zurück"))
+        egui::RichText::new(t("Doppelklick auf einen Namen setzt den Regler auf den Stand beim Import"))
             .size(10.0)
             .color(farbe::TEXT_LEISE),
     );

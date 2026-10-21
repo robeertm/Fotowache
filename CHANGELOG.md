@@ -2,6 +2,52 @@
 
 All notable changes to Fotowache. Versions follow [Semantic Versioning](https://semver.org/).
 
+## [2.2.0] - 2026-10-21
+
+### Reset
+- **Reset to how the photo was imported:** a Reset button next to before/after
+  and in the toolbar (Ctrl/⌘ + Shift + R) returns all sliders, crop, rotation,
+  retouching and added content to the state the photo had when it was opened
+  (automatic settings, or the settings of another application's XMP file).
+  Undo brings the edits back.
+- Works on all selected photos at once; star ratings are kept.
+- Every slider group has its own reset (↺ next to the group name), shown only
+  when something in the group was changed.
+- Double-clicking a slider name now returns it to its imported value instead of
+  zero — the automatic settings already set values on import, so zero was never
+  where the photo started.
+- A photo moved back exactly to its imported state counts as unedited again.
+
+### Sharpness
+- **The fitted view on high-density screens was soft:** it showed the reduced
+  working copy stretched to the screen. It now shows a section developed from
+  the full raw data at the exact screen resolution (recomputed when you let go
+  of a slider).
+- **1:1 and the zoom percentage** now refer to physical screen pixels; before,
+  1:1 on such screens was really 200 % and interpolated.
+- **Export and 100 % view:** the lens correction now samples with a Lanczos
+  filter instead of bilinear interpolation, which cost fine detail on every
+  photo with a lens profile. Noise reduction behind the correction was widened
+  to match, so high-ISO photos are not noisier than before.
+- Holding before/after now also switches the full-resolution section; the
+  clipping warning (J) appears there too.
+
+### Image generator
+- **Unrestricted mode (18+), optional:** a second open image model without a
+  content filter, unlocked after confirming your age with your date of birth
+  (only the confirmation is stored). Fixed limits: descriptions aimed at
+  children or teenagers are refused before the model starts, the model is
+  always told that everyone shown is an adult, and it only creates images from
+  a description, never from your photos. Separate download of about 8.5 GB.
+- Command line: `--frei-bestaetigen DD.MM.YYYY`, `--frei-installieren`,
+  `--frei-entfernen`, `--bild "…" --frei`.
+- The generator window opens centred instead of under the rating bar.
+
+### Fixes
+- Undoing a retouch or added content now also removes it from the picture.
+- Changes to detail, effects and lens sliders are saved right away, not only
+  when switching photos.
+
 ## [2.1.0] - 2026-10-21
 
 ### Local AI
