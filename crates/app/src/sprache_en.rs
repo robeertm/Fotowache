@@ -456,6 +456,10 @@ pub const EN: &[(&str, &str)] = &[
     ("~1 min", "~1 min"),
     ("~3–4 min", "~3–4 min"),
     ("Freier Modus (ab 18)", "Unrestricted mode (18+)"),
+    (
+        "Ohne Stilangabe entsteht ein Foto. Für Comic, Zeichnung oder Gemälde das Wort in die Beschreibung schreiben.",
+        "Without a style, you get a photo. For a comic, drawing or painting, put that word in the description.",
+    ),
     ("Ein zweites, offenes Bildmodell ohne Inhaltsfilter — für Erwachsene. Nichts mit Minderjährigen, nur Bilder aus einer Beschreibung, nie aus deinen Fotos.", "A second, open image model without a content filter — for adults. Nothing involving minors; images from a description only, never from your photos."),
     ("Altersbestätigung", "Age confirmation"),
     ("Der freie Modus kann Nacktheit und Inhalte für Erwachsene erzeugen. Er ist nur für Volljährige. Gespeichert wird nur, dass du bestätigt hast — nicht dein Geburtsdatum.", "Unrestricted mode can create nudity and adult content. It is for adults only. Only the fact that you confirmed is stored — not your date of birth."),

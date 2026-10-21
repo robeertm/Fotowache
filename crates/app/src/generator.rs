@@ -89,10 +89,17 @@ pub fn verfuegbar() -> Result<(), String> {
     }
     if cfg!(target_os = "macos") {
         // Das fertige Paket verlangt Systemversion 26 (minos 26.0, gemessen).
-        let v = Command::new("sw_vers").arg("-productVersion").output().ok();
-        let major: u32 = v
-            .and_then(|o| String::from_utf8_lossy(&o.stdout).split('.').next().and_then(|m| m.trim().parse().ok()))
-            .unwrap_or(0);
+        // Einmal fragen: das Generator-Fenster ruft dies bei jedem Bildaufbau
+        // auf, und ein Prozessstart je Bild hielt die Oberflaeche an.
+        static MAJOR: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+        let major = *MAJOR.get_or_init(|| {
+            Command::new("sw_vers")
+                .arg("-productVersion")
+                .output()
+                .ok()
+                .and_then(|o| String::from_utf8_lossy(&o.stdout).split('.').next().and_then(|m| m.trim().parse().ok()))
+                .unwrap_or(0)
+        });
         if major < 26 {
             return Err(t("Der Bildgenerator braucht eine neuere Systemversion (26 oder neuer).").into());
         }
@@ -492,6 +499,33 @@ pub fn frei_gesperrt(text: &str) -> bool {
     false
 }
 
+/// Woerter, mit denen jemand ausdruecklich KEIN Foto will (de/en/fr/es/it/nl/pl).
+const ZEICHENSTIL: &[&str] = &[
+    "comic", "comics", "manga", "anime", "cartoon", "zeichnung", "gezeichnet", "illustration", "illustriert",
+    "gemälde", "gemalt", "malerei", "aquarell", "ölbild", "skizze", "drawing", "drawn", "painting", "painted",
+    "watercolor", "watercolour", "sketch", "3d", "pixelart", "dessin", "peinture", "dibujo", "pintura",
+    "acuarela", "disegno", "pittura", "fumetto", "tekening", "schilderij", "rysunek", "kreskówka",
+];
+
+/// Der Auftrag an das freie Modell. Ohne Stilangabe malt es (gemessen: deutsche
+/// wie englische Beschreibungen kamen als Illustration heraus, mit Foto-Vorgabe
+/// als Foto) — also ist ein Foto der Standard, ausser die Beschreibung
+/// verlangt ausdruecklich einen Zeichenstil.
+pub fn frei_auftrag(beschreibung: &str) -> String {
+    let klein = beschreibung.to_lowercase();
+    let gezeichnet = klein
+        .split(|c: char| !c.is_alphanumeric())
+        .any(|w| ZEICHENSTIL.contains(&w) || w.starts_with("comic") || w.starts_with("zeichn"));
+    if gezeichnet {
+        return beschreibung.trim().to_string();
+    }
+    format!(
+        "Photograph, shot on a full-frame camera with a 50mm lens, natural light, realistic skin texture, \
+         film grain, true-to-life colours. {}",
+        beschreibung.trim()
+    )
+}
+
 /// Erzeugt ein Bild mit dem freien Modell. Gesperrte Beschreibungen kommen gar
 /// nicht erst bei der Laufzeit an.
 pub fn frei_erzeugen(beschreibung: &str, format: Format, seed: u64, ziel: &Path) -> Result<(), String> {
@@ -514,7 +548,7 @@ pub fn frei_erzeugen(beschreibung: &str, format: Format, seed: u64, ziel: &Path)
     // Immer dazu: alle Personen sind Erwachsene. Ein Negativ-Text wuerde bei
     // diesem Modell nur mit doppelter Rechenzeit (und schwach) wirken; die
     // Wortsperre oben ist die eigentliche Grenze.
-    let auftrag = format!("{beschreibung}. All people shown are adults, at least 25 years old.");
+    let auftrag = format!("{}. All people shown are adults, at least 25 years old.", frei_auftrag(beschreibung));
     let mut cmd = Command::new(&programm);
     cmd.arg("--diffusion-model")
         .arg(o.join(FREI_BILD.name))
@@ -607,6 +641,16 @@ mod tests {
         ] {
             assert!(!frei_gesperrt(erlaubt), "faelschlich gesperrt: {erlaubt}");
         }
+    }
+
+    #[test]
+    fn freier_auftrag_ist_ein_foto_ausser_auf_wunsch() {
+        assert!(frei_auftrag("Eine Frau im Café").starts_with("Photograph"));
+        assert!(frei_auftrag("A man at the harbour").starts_with("Photograph"));
+        assert_eq!(frei_auftrag("Ein Comic von einer Katze"), "Ein Comic von einer Katze");
+        assert_eq!(frei_auftrag("watercolor painting of a lake"), "watercolor painting of a lake");
+        assert_eq!(frei_auftrag("Zeichnung eines Hauses"), "Zeichnung eines Hauses");
+        assert!(frei_auftrag("Comicverlag im Altbau").starts_with("Comic"));
     }
 
     #[test]

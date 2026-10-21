@@ -217,6 +217,26 @@ fn strerror(code: c_int) -> String {
     }
 }
 
+/// Haelt die OpenMP-Laufzeit von LibRaw fuer die ganze Programmdauer wach.
+/// Einmal im Hauptfaden aufrufen, bevor dekodiert wird.
+///
+/// Die LLVM-Laufzeit faehrt herunter, sobald der letzte Faden endet, der sie
+/// benutzt hat — dekodiert wird aber in kurzlebigen Faeden. Danach zeigt die
+/// zwischengespeicherte Sperre in LibRaws Speicherverwaltung
+/// (`#pragma omp critical`) ins Leere, und der naechste Dekodier-Faden stuerzt
+/// ab (gemessen: zweiter Faden, SIGSEGV in `__kmpc_critical_with_hint`).
+/// Der Hauptfaden endet erst mit dem Programm; meldet er sich einmal an,
+/// bleibt die Laufzeit stehen (nachgemessen: acht Lade-Faeden nacheinander).
+pub fn openmp_festhalten() {
+    #[cfg(mit_openmp)]
+    unsafe {
+        unsafe extern "C" {
+            fn omp_get_max_threads() -> std::os::raw::c_int;
+        }
+        omp_get_max_threads();
+    }
+}
+
 /// Liest eine RAW-Datei und entwickelt sie bis zum linearen Kamerabild.
 pub fn decode(path: impl AsRef<Path>, opts: &DecodeOptions) -> Result<RawImage, RawError> {
     let path = path.as_ref();

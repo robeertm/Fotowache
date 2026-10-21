@@ -45,6 +45,10 @@ fn main() -> eframe::Result<()> {
     // Praktisch fuer grosse Mengen ueber Nacht — und der Weg, auf dem sich die
     // Stapelverarbeitung ueberpruefen laesst, ohne durch die Oberflaeche zu klicken.
     let argv: Vec<String> = std::env::args().skip(1).collect();
+    // Vor jedem Dekodieren: OpenMP-Laufzeit im Hauptfaden festhalten — sonst
+    // stuerzt LibRaw ab, sobald ein zweiter Lade-Faden nach einem beendeten
+    // ersten startet (Klick auf eine Miniatur, 2.2.0).
+    rawcore::openmp_festhalten();
     // Ordner aus der Zeit vor dem Namen „Fotowache" mitnehmen (einmalig).
     ordner::umziehen();
     // Retusche-Modell der lokalen KI bekannt machen (falls installiert).
@@ -834,6 +838,9 @@ struct App {
 
     loading: Option<PathBuf>,
     status: String,
+    /// Wann zuletzt eine Meldung (statt des Zaehlers) in die Statuszeile kam.
+    /// Das Sichern frischt sonst den Zaehler auf und wischt sie sofort weg.
+    meldung_seit: Option<std::time::Instant>,
     last_render_ms: f32,
     histogram: [ [f32; 64]; 3],
     needs_render: bool,
@@ -972,6 +979,9 @@ struct App {
 
 impl App {
     fn new() -> Self {
+        // Auch hier (nicht nur in `main`): Pruefstaende bauen die App ohne
+        // `main` — und laden ebenfalls in wechselnden Faeden.
+        rawcore::openmp_festhalten();
         let (tx, rx) = channel();
         // Der Bildschirmname kommt aus dem Farbprofil — in der Sprache der
         // Oberflaeche (vor dem Lesen setzen, das passiert in Gpu::new).
@@ -1006,6 +1016,7 @@ impl App {
             thumb_aktuell: None,
             loading: None,
             status,
+            meldung_seit: None,
             last_render_ms: 0.0,
             histogram: [[0.0; 64]; 3],
             needs_render: false,
@@ -1824,7 +1835,15 @@ impl App {
         }
         self.dirty = false;
         self.dirty_at = None;
-        self.zaehler_auffrischen();
+        if self.meldung_seit.is_none_or(|t| t.elapsed() > std::time::Duration::from_secs(5)) {
+            self.zaehler_auffrischen();
+        }
+    }
+
+    /// Eine Meldung, die das naechste Sichern nicht gleich wieder ueberschreibt.
+    fn melden(&mut self, text: String) {
+        self.status = text;
+        self.meldung_seit = Some(std::time::Instant::now());
     }
 
     fn mark_dirty(&mut self) {
@@ -2273,6 +2292,15 @@ impl App {
                              Nichts mit Minderjährigen, nur Bilder aus einer Beschreibung, nie aus deinen Fotos.",
                         ));
                 });
+                if self.gen_frei && self.gen_frei_bestaetigt && self.gen_frei_installiert {
+                    ui.label(
+                        egui::RichText::new(t(
+                            "Ohne Stilangabe entsteht ein Foto. Für Comic, Zeichnung oder Gemälde das Wort in die Beschreibung schreiben.",
+                        ))
+                        .small()
+                        .weak(),
+                    );
+                }
                 if self.gen_frei && !self.gen_frei_bestaetigt {
                     egui::Frame::group(ui.style()).show(ui, |ui| {
                         ui.label(egui::RichText::new(t("Altersbestätigung")).strong());
@@ -3965,7 +3993,7 @@ impl App {
         }
         self.push_undo();
         self.bearbeitung_setzen(grund);
-        self.status = t("Auf den Stand beim Import zurückgesetzt — ⌘Z holt die Bearbeitung zurück").into();
+        self.melden(t("Auf den Stand beim Import zurückgesetzt — ⌘Z holt die Bearbeitung zurück").into());
     }
 
     /// Zuruecksetzen fuer alle markierten Fotos (⇧⌘R), sonst fuer das offene.
@@ -4029,8 +4057,7 @@ impl App {
             self.thumbs.remove(p);
             anzahl += 1;
         }
-        self.status = tf("{} Foto(s) auf den Stand beim Import zurückgesetzt", &[&anzahl]);
-        self.zaehler_auffrischen();
+        self.melden(tf("{} Foto(s) auf den Stand beim Import zurückgesetzt", &[&anzahl]));
     }
 
     /// Weissabgleich aus einer Flaeche des Fotos (Anteile im Sensorbild):

@@ -100,7 +100,9 @@ everything runs on your own computer: no photo leaves it, no account, no cost.
   limits that cannot be switched off: any description aimed at children or
   teenagers is refused before the model starts, the model is always told that
   everyone shown is an adult, and it only creates images from a description —
-  never from your own photos. Separate download of about 8.5 GB, roughly four
+  never from your own photos. It creates photographs unless the description
+  names a drawing style (comic, drawing, painting …); English descriptions are
+  understood most precisely. Separate download of about 8.5 GB, roughly four
   minutes per image.
 
 The local AI is not offered on systems whose C library is too old (glibc older
