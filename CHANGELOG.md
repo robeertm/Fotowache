@@ -24,11 +24,17 @@ All notable changes to Fotowache. Versions follow [Semantic Versioning](https://
   `--ohne-automatik` (all sliders at zero).
 
 ### Panorama
-- New **Panorama…** for two or more selected photos: overlaps are found
-  automatically in any order, photos that do not fit are left out with a
-  reason, all photos are aligned together (bundle adjustment) with estimated
-  focal length and lens distortion, brightness is matched, seams are placed
-  where the photos agree and blended across several frequency bands.
+- New **Panorama…** for two or more selected photos, built on the published
+  methods for this task: overlaps are found automatically in any order, photos
+  that do not fit are left out with a reason, all photos are aligned together
+  as rotations around one point with one shared focal length (bundle
+  adjustment), the horizon is straightened, brightness is matched, seams are
+  placed where the photos agree (moving people come from one photo only) and
+  blended across several frequency bands.
+- **Parallax correction:** where nearby and distant objects do not line up
+  (handheld series), the photos are adjusted along the seams with a
+  content-preserving mesh warp that keeps straight lines straight. If the
+  photos were taken from clearly different positions, the report says so.
 - Lens distortion, colour fringing and vignetting are corrected from the
   camera's or the database's lens profile before stitching; the panorama keeps
   the capture date.
@@ -38,7 +44,7 @@ All notable changes to Fotowache. Versions follow [Semantic Versioning](https://
 - The panorama is saved as a linear DNG next to the photos and is developed
   like any other raw file.
 - Command line: `--panorama <files…>` with `--projektion`, `--raender-fuellen`,
-  `--ohne-zuschnitt`, `--voll`.
+  `--ohne-zuschnitt`, `--ohne-parallaxe`, `--voll`.
 
 ### Updates
 - Fotowache looks for a newer release at start and offers it with one button;
