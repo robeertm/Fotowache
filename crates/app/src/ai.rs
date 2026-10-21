@@ -1,63 +1,29 @@
-//! KI-Anbindung — derselbe Vertrag wie in der Web-Version.
+//! Lokale KI — das Foto verstehen, dann nach festen Regeln entwickeln.
 //!
-//! Der Text der Anweisung ist **wörtlich aus `site/app.js` übernommen** (`AI_KEYS_SPEC`,
-//! `AI_ASK_BASE`). Das ist Absicht: der Wortlaut wurde über viele Runden
-//! geschliffen (kein Grauschleier, nie zu warm, nie matschig). Ein neu erfundener
-//! Prompt würde anders entwickeln — und die Web-Version und das Programm lieferten
-//! plötzlich verschiedene Ergebnisse für dasselbe Foto. Deshalb wird hier auch
-//! nichts übersetzt: was an den Server geht, bleibt in jeder Sprache gleich. Nur
-//! die Meldungen für die Oberfläche laufen über `sprache::t`.
+//! ## Arbeitsteilung
+//! Ein kleines Bildmodell auf dem eigenen Rechner (`ki_lokal`) ist gut darin, ein
+//! Foto zu VERSTEHEN: was ist zu sehen, welches Licht, Menschen, Himmel, Dunst,
+//! ein ungewollter Farbstich. Zahlen fuer Regler waehlt es dagegen schlecht —
+//! gemessen: es setzte fast alles auf 0 oder schrieb die Beispielwerte aus der
+//! Anweisung ab. Deshalb:
 //!
-//! Weg der Anfrage: derselbe KI-Server wie in der Web-Version (`/api/ai/develop`).
-//! Der Zugang zum Modell liegt server-seitig; im Browser ging das nicht (der
-//! KI-Anbieter sperrt CORS für Abo-Organisationen), und auch hier ist es der
-//! bessere Weg — so gibt es genau eine Stelle, an der ein Token liegt, statt
-//! einer Kopie auf jedem Rechner.
+//! 1. **Beschreiben** — das Modell beschreibt das Foto frei (darin ist es gut).
+//! 2. **Einordnen** — im selben Gespraech ordnet es seine Beschreibung in feste
+//!    Kategorien ein. Ohne erzwungenes Antwortschema: mit Schema waehlte es
+//!    gemessen fast immer die ersten Werte der Listen („Feier in Innenraeumen"
+//!    fuer eine Berglandschaft). Gelesen wird nachsichtig (`Einordnung::lesen`).
+//! 3. **Regeln** — Fotowache macht daraus Regler: ein Grundlook je Szene, ein
+//!    Zuschlag je gewuenschtem Look, dazu Korrekturen aus GEMESSENEN Werten
+//!    (Lichter-Beschnitt, Helligkeit, Farbstich) — jeweils nur, wenn Messung und
+//!    Einschaetzung des Modells zusammenpassen.
+//!
+//! Alles liegt auf der Automatik obendrauf, und die Leitplanken der
+//! Aufnahme-Grundeinstellungen gelten weiter.
 
 use crate::sprache::{t, tf};
 use pipeline::params::Edit;
 
-/// Erlaubte Regler samt Wertebereichen — wörtlich aus der Web-Version.
-const AI_KEYS_SPEC: &str = concat!(
-    "Allowed keys (all optional, integers, ranges in brackets):\n",
-    "exposure[-100..100], contrast[-100..100], highlights[-100..100], shadows[-100..100], whites[-100..100], blacks[-100..100],\n",
-    // Symmetrisch formuliert. Vorher stand hier nur „never yellow/orange" — die KI
-    // wich der einen genannten Gefahr aus und landete regelmaessig auf der anderen
-    // Seite: die Fotos kamen oft zu kuehl heraus.
-    "temp[-100..100 warmer=+; keep near 0. Whites must be NEUTRAL white — avoid a warm/yellow/orange cast AND equally a cool/blue/cyan cast. Neither direction is 'safer' than the other],\n",
-    "tint[-100..100 magenta=+], vibrance[-100..100], saturation[-40..60 keep colour, never grey],\n",
-    "clarity[-100..100], texture[-100..100], dehaze[-100..100], vignette[-100..100], grain[0..100],\n",
-    // Diese fuenf sind Aufnahme-Grundeinstellungen, kein Look. Die KI hat sie
-    // regelmaessig HERUNTERGESETZT (Schaerfe 38 -> 25, Farbrauschen 22 -> 5) und
-    // damit die Grundschaerfung wieder weggenommen.
-    "sharpen[0..100], sharpenRadius[0..100], sharpenMask[0..100], noise[0..100], colorNoise[0..100] — these are ALREADY set to correct capture defaults for this camera. Raise them only if this photo genuinely needs more; NEVER lower them.\n",
-    "gradeShadowHue[0..360], gradeShadowSat[0..100], gradeMidHue[0..360], gradeMidSat[0..100], gradeHighHue[0..360], gradeHighSat[0..100], gradeBalance[-100..100],\n",
-    "hslH, hslS, hslL = arrays of 8 integers[-100..100] for [red,orange,yellow,green,cyan,blue,violet,magenta],\n",
-    "curve = array of 5 increasing numbers[0..1], output at inputs 0,0.25,0.5,0.75,1; MUST rise dark→bright, neutral = [0,0.25,0.5,0.75,1]; never inverted like [1,0.75,0.5,0.25,0]. Omit if unsure.\n",
-);
-
-const AI_ASK_BASE: &str = concat!(
-    "Analyse this photo and return development parameters as ONE JSON object. ",
-    "Make it a natural, positive COLOUR photo — never a negative and never black & white.\n",
-);
-
-const AI_ASK_TAIL: &str = concat!(
-    "Express your whole edit through these keys: besides exposure & white balance, also set the creative controls you would actually use for this photo — contrast, highlights/shadows, clarity, texture, vibrance, and where it helps the mood also HSL per colour and split-toning. That way every slider reflects your development and the user can fine-tune it. Keep it natural, never extreme.\n",
-    "IMPORTANT — keep the photo crisp and true, never muddy or washed out: keep noise reduction (noise) low (0..20) so you never blur away detail; do NOT push contrast, clarity, texture or dehaze to extremes; avoid a flat, grey, over-smoothed or over-sharpened look. When in doubt, edit gently.\n",
-    // Gemessen: die KI hob auf einem Wiesenbild Dynamik +12, Saettigung +8 UND
-    // zusaetzlich Gruen +10 und Gelb +8 an. Das summiert sich, und das Foto kippt
-    // ins Gruene — ein sichtbarer Gruenstich.
-    "DO NOT STACK COLOUR BOOSTS: vibrance and saturation already lift every colour. On top of that, do NOT also raise hslS for the colour family that already dominates the frame (green foliage/grass, blue sky, orange skin) — the whole photo then takes on that colour. Use hslS mainly to hold a colour BACK, or to lift a colour that is under-represented.\n",
-    "COLOUR CAST — the photo must look neutral, not tinted. Split-toning (gradeShadow*, gradeMid*, gradeHigh*) is for a DELIBERATE look only. Do NOT tint the shadows blue or cyan to make the photo look 'clean' or 'modern' — that reads as a cold, lifeless cast. If you are not deliberately going for a warm or cool look, leave ALL grade* values at 0.\n",
-    "CRUCIAL — NEVER leave a grey veil / milky haze: the deepest shadows must reach a proper near-black (a clean black point), the image must never look faded, washed-out or foggy. Do NOT lift 'blacks' or 'shadows' so far that darks turn grey. If anything, secure the black point (negative 'blacks' or a slightly S-shaped 'curve') so the photo stays punchy and clear.\n",
-    "Also include THREE short text fields, all written in natural GERMAN:\n",
-    "  \"sceneLabel\" — very short scene tag (max ~6 words),\n",
-    "  \"look\" — the look you chose, e.g. \"natürlich & frisch\",\n",
-    "  \"description\" — ONE or TWO friendly sentences describing what is in the photo. Under 200 characters, no markdown.\n",
-    "Answer with the JSON object only, no prose around it.\n",
-);
-
-/// Wie kräftig die KI entwickeln soll — wie der Stärke-Regler der Web-Version.
+/// Wie kräftig die KI entwickeln soll.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Strength {
     Sanft,
@@ -66,14 +32,14 @@ pub enum Strength {
 }
 
 impl Strength {
-    fn hint(self) -> &'static str {
+    fn faktor(self) -> f32 {
         match self {
-            Strength::Sanft => "\nEDIT STRENGTH: The user wants a SUBTLE, restrained edit — correct what is wrong, add little.",
-            Strength::Normal => "",
-            Strength::Kraeftig => "\nEDIT STRENGTH: The user wants a STRONG, punchy, expressive edit — be more assertive with exposure, contrast, clarity, dehaze and colour, while staying believable and never unnatural, blown-out or muddy.",
+            Strength::Sanft => 0.6,
+            Strength::Normal => 1.0,
+            Strength::Kraeftig => 1.5,
         }
     }
-    /// Fuer die Oberflaeche — an den Server geht nur `hint()`.
+    /// Fuer die Oberflaeche.
     pub fn label(self) -> &'static str {
         match self {
             Strength::Sanft => t("sanft"),
@@ -83,7 +49,7 @@ impl Strength {
     }
 }
 
-/// Was die KI zurückgemeldet hat — Regler plus die drei Beschreibungsfelder.
+/// Was die KI zurückgemeldet hat — Regler plus Beschreibung.
 #[derive(Debug, Clone, Default)]
 pub struct AiResult {
     pub edit: Edit,
@@ -91,33 +57,26 @@ pub struct AiResult {
     pub scene_label: String,
     pub look: String,
     pub description: String,
-    /// Die Antwort der KI im Wortlaut — fuers Protokoll. Ohne sie steht bei einer
-    /// merkwuerdigen Entwicklung nur „25 Regler gesetzt" da und man weiss nicht,
-    /// ob die KI Unsinn geschickt oder der Empfang etwas verschluckt hat.
+    /// Die Antworten des Modells im Wortlaut — fuers Protokoll.
     pub roh: String,
     /// Welche Werte sich tatsaechlich geaendert haben, als Text.
     pub geaendert: Vec<String>,
-    /// Was gegen die Untergrenzen der Aufnahme-Grundeinstellungen verstiess und
-    /// zurechtgerueckt wurde. Steht im Protokoll.
+    /// Was gegen die Leitplanken verstiess und zurechtgerueckt wurde.
     pub zurechtgerueckt: Vec<String>,
 }
 
 #[derive(Debug)]
 pub enum AiError {
-    Net(String),
-    Http { code: u16, body: String },
-    Parse,
+    Dienst(String),
     Encode(String),
 }
 
-/// Von Hand statt ueber `thiserror`: die Meldung landet in der Oberflaeche und
-/// entsteht deshalb erst beim Anzeigen, in der gerade gewaehlten Sprache.
+/// Von Hand statt ueber `thiserror`: die Meldung entsteht erst beim Anzeigen,
+/// in der gerade gewaehlten Sprache.
 impl std::fmt::Display for AiError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let text = match self {
-            AiError::Net(e) => tf("Der KI-Server ist nicht erreichbar: {}", &[e]),
-            AiError::Http { code, body } => tf("Der KI-Server hat abgelehnt ({}): {}", &[code, body]),
-            AiError::Parse => t("Antwort war kein verwertbares JSON").to_string(),
+            AiError::Dienst(e) => tf("Lokale KI: {}", &[e]),
             AiError::Encode(e) => tf("Bild konnte nicht verpackt werden: {}", &[e]),
         };
         f.write_str(&text)
@@ -126,89 +85,430 @@ impl std::fmt::Display for AiError {
 
 impl std::error::Error for AiError {}
 
-/// Anweisung für die Nachkontrolle — die KI sieht ihr eigenes Ergebnis und
-/// korrigiert nach. Inhaltlich aus der Web-Version übernommen (dort „Feinschliff").
-const AI_REVIEW: &str = concat!(
-    "This is the SAME photo after your development. Judge it critically against high-end ",
-    "professional standards: correct exposure, natural NEUTRAL white balance (whites white, ",
-    "skin natural — neither a warm/yellow/orange cast NOR a cool/blue/cyan one; check the ",
-    "shadows in particular for a blue tinge), no grey veil, no muddy or over-smoothed ",
-    "look, no clipped highlights, no blocked shadows, colours rich but believable.\n",
-    "Return ONE JSON object with the CORRECTED full set of parameters (same keys as before). ",
-    "If something is already right, keep its value. Only change what genuinely needs changing — ",
-    "small, deliberate corrections, not a new look.\n",
-);
+// ---------------------------------------------------------------------------
+// Einordnung
+// ---------------------------------------------------------------------------
 
-/// Fragt die KI und gibt die zusammengeführten Regler zurück.
-///
-/// `base_edit` ist der aktuelle Stand — die KI-Antwort wird daraufgelegt, statt alles
-/// zu ersetzen. Nur genannte Schlüssel ändern sich (siehe `Edit::merge_json`).
-pub fn develop(
-    endpoint: &str,
-    rgba: &[u8],
-    width: u32,
-    height: u32,
-    base_edit: &Edit,
-    strength: Strength,
-    review: bool,
-) -> Result<AiResult, AiError> {
-    let jpeg = encode_small_jpeg(rgba, width, height, 1200)?;
-    let b64 = base64_encode(&jpeg);
+/// Die Kategorien, in die das Modell das Foto einordnet. Die Werte sind der
+/// Vertrag mit dem Modell (englisch, so steht es in der Anweisung).
+pub const SZENEN: &[&str] = &[
+    "portrait", "group_of_people", "event_or_party_indoors", "interior_room", "landscape",
+    "city_or_architecture", "sunset_or_sunrise", "night", "food_or_still_life", "nature_closeup",
+    "beach_or_snow", "aerial_view", "other",
+];
+const LICHT: &[&str] = &[
+    "direct_sun", "overcast_or_shade", "golden_hour", "warm_indoor_light", "mixed_indoor_light", "flash",
+    "backlight", "night_lights",
+];
+const MENSCHEN: &[&str] = &["none", "small_in_frame", "prominent_faces"];
+const HIMMEL: &[&str] = &["none", "some", "large_part"];
+const DUNST: &[&str] = &["no", "yes"];
+const HELLIGKEIT: &[&str] = &["too_dark", "slightly_dark", "right", "slightly_bright", "too_bright"];
+const STICH: &[&str] = &["none_or_intended", "too_warm_yellow", "too_cool_blue", "too_green", "too_magenta"];
+pub const LOOKS: &[&str] = &["natural", "vivid", "soft", "dramatic", "warm", "cool"];
 
-    let ask = if review {
-        format!("{AI_REVIEW}{AI_KEYS_SPEC}{}", strength.hint())
-    } else {
-        format!("{AI_ASK_BASE}{AI_KEYS_SPEC}{AI_ASK_TAIL}{}", strength.hint())
+const FELDER: &[(&str, &[&str])] = &[
+    ("scene", SZENEN),
+    ("light", LICHT),
+    ("people", MENSCHEN),
+    ("sky", HIMMEL),
+    ("haze", DUNST),
+    ("brightness", HELLIGKEIT),
+    ("colour_cast", STICH),
+    ("look", LOOKS),
+];
+
+/// Erste Frage: frei beschreiben.
+const FRAGE_BESCHREIBEN: &str = "Describe this photo for a photo editor in 2-3 sentences: the main subject, \
+indoors or outdoors, people and faces, how much sky, the light, the colours, and anything that looks wrong \
+(too dark, too bright, colour cast, haze).";
+
+fn frage_einordnen() -> String {
+    let mut s = String::from(
+        "Based on your description, classify the photo. Answer with ONE JSON object and nothing else, \
+         choosing exactly one allowed value per key:\n",
+    );
+    for (k, werte) in FELDER {
+        s.push_str(&format!("\"{k}\": {}\n", werte.join(" | ")));
+    }
+    // Die Beschreibung in der Sprache der Oberflaeche.
+    let sprache = match crate::sprache::aktuell() {
+        crate::sprache::Sprache::De => "German",
+        crate::sprache::Sprache::En => "English",
     };
-    let body = serde_json::json!({
-        "imageBase64": b64,
-        "mime": "image/jpeg",
-        "maxTokens": 1400,
-        "user": ask,
-    });
+    s.push_str(&format!(
+        "\"description\": one short friendly {sprache} sentence about what is in the photo.\n\
+         Rules: colour_cast only for an UNWANTED cast (warm sunset or candle light is intended). \
+         haze only for real fog or haze. look = the finished look that would suit the photo best."
+    ));
+    s
+}
 
-    let url = format!("{}/api/ai/develop", endpoint.trim_end_matches('/'));
-    let resp = ureq::post(&url)
-        .config()
-        .timeout_global(Some(std::time::Duration::from_secs(90)))
-        .build()
-        .send_json(&body);
+/// Die gelesene Einordnung. Fehlt ein Feld, gilt der neutrale Wert.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Einordnung {
+    pub szene: &'static str,
+    pub licht: &'static str,
+    pub menschen: &'static str,
+    pub himmel: &'static str,
+    pub dunst: bool,
+    pub helligkeit: &'static str,
+    pub stich: &'static str,
+    pub look: &'static str,
+    pub beschreibung: String,
+}
 
-    let mut resp = match resp {
-        Ok(r) => r,
-        Err(ureq::Error::StatusCode(code)) => {
-            return Err(AiError::Http {
-                code,
-                body: t("siehe Server-Protokoll").into(),
+impl Einordnung {
+    /// Liest die Antwort nachsichtig: je Feld der erste erlaubte Wert, der nach
+    /// dem Feldnamen steht. Das Modell setzt gelegentlich `\"` oder Zeilen-
+    /// umbrueche, wo JSON keine erlaubt — ein strenger Parser verwarf dann
+    /// die ganze Antwort (gemessen: 18 von 28).
+    pub fn lesen(roh: &str) -> Option<Einordnung> {
+        let wert = |feld: &str, erlaubt: &[&'static str]| -> Option<&'static str> {
+            let i = roh.find(&format!("\"{feld}"))? + feld.len() + 1;
+            let rest = &roh[i..roh.len().min(i + 80)];
+            // Den frühesten passenden Wert nehmen; laengere zuerst, damit
+            // „slightly_dark" nicht als „dark"-Teil missverstanden wird.
+            erlaubt
+                .iter()
+                .filter_map(|w| rest.find(w).map(|p| (p, std::cmp::Reverse(w.len()), *w)))
+                .min()
+                .map(|(_, _, w)| w)
+        };
+        let szene = wert("scene", SZENEN)?;
+        // „description" (frueher „description_de" — beide lesen).
+        let beschreibung = roh
+            .find("\"description")
+            .map(|i| &roh[i + 1..])
+            .map(|r| r.trim_start_matches("description").trim_start_matches("_de"))
+            .map(|r| {
+                let r = r.trim_start_matches(|c: char| c == '"' || c == '\\' || c == ':' || c.is_whitespace());
+                let ende = r.find(|c: char| c == '"' || c == '\\' || c == '\n').unwrap_or(r.len());
+                r[..ende].trim().to_string()
             })
+            .unwrap_or_default();
+        Some(Einordnung {
+            szene,
+            licht: wert("light", LICHT).unwrap_or("overcast_or_shade"),
+            menschen: wert("people", MENSCHEN).unwrap_or("none"),
+            himmel: wert("sky", HIMMEL).unwrap_or("none"),
+            dunst: wert("haze", DUNST) == Some("yes"),
+            helligkeit: wert("brightness", HELLIGKEIT).unwrap_or("right"),
+            stich: wert("colour_cast", STICH).unwrap_or("none_or_intended"),
+            look: wert("look", LOOKS).unwrap_or("natural"),
+            beschreibung,
+        })
+    }
+}
+
+/// Deutsche Anzeige der Szene (laeuft durch die Uebersetzung).
+pub fn szene_text(s: &str) -> &'static str {
+    match s {
+        "portrait" => t("Porträt"),
+        "group_of_people" => t("Menschen in der Gruppe"),
+        "event_or_party_indoors" => t("Feier in Innenräumen"),
+        "interior_room" => t("Innenraum"),
+        "landscape" => t("Landschaft"),
+        "city_or_architecture" => t("Stadt und Architektur"),
+        "sunset_or_sunrise" => t("Sonnenauf- oder -untergang"),
+        "night" => t("Nacht"),
+        "food_or_still_life" => t("Essen oder Stillleben"),
+        "nature_closeup" => t("Natur von nah"),
+        "beach_or_snow" => t("Strand oder Schnee"),
+        "aerial_view" => t("Luftaufnahme"),
+        _ => t("Sonstiges"),
+    }
+}
+
+/// Deutsche Anzeige des Looks.
+pub fn look_text(s: &str) -> &'static str {
+    match s {
+        "vivid" => t("lebendig"),
+        "soft" => t("weich"),
+        "dramatic" => t("dramatisch"),
+        "warm" => t("warm"),
+        "cool" => t("kühl"),
+        _ => t("natürlich"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Messwerte
+// ---------------------------------------------------------------------------
+
+/// Am entwickelten Vorschaubild gemessen (sRGB, 8 Bit).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Messwerte {
+    /// Logarithmisches Mittel der Helligkeit in Blenden gegen Mittelgrau.
+    pub helligkeit_ev: f32,
+    /// Anteil ausgefressener Pixel in Prozent.
+    pub lichter_prozent: f32,
+    /// Neutralton: R - B und G - (R+B)/2 der fast farblosen Mitten (0..255).
+    pub warm_kalt: f32,
+    pub gruen_magenta: f32,
+}
+
+impl Messwerte {
+    pub fn aus(rgba: &[u8], w: u32, h: u32) -> Messwerte {
+        let lin = |v: u8| {
+            let c = v as f32 / 255.0;
+            if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
+        };
+        let schritt = ((w.max(h) / 512).max(1)) as usize;
+        let (mut log_summe, mut n, mut hell) = (0.0f64, 0usize, 0usize);
+        let (mut rb, mut gm, mut nn) = (0.0f64, 0.0f64, 0usize);
+        for y in (0..h as usize).step_by(schritt) {
+            for x in (0..w as usize).step_by(schritt) {
+                let i = (y * w as usize + x) * 4;
+                let (r, g, b) = (rgba[i], rgba[i + 1], rgba[i + 2]);
+                let yl = 0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b);
+                log_summe += ((yl + 1e-4) as f64).ln();
+                n += 1;
+                if r.max(g).max(b) > 251 {
+                    hell += 1;
+                }
+                let sat = r.max(g).max(b) as i32 - r.min(g).min(b) as i32;
+                if sat < 30 && yl > 0.05 && yl < 0.8 {
+                    rb += r as f64 - b as f64;
+                    gm += g as f64 - (r as f64 + b as f64) / 2.0;
+                    nn += 1;
+                }
+            }
         }
-        Err(e) => return Err(AiError::Net(e.to_string())),
+        let n = n.max(1);
+        let mittel = (log_summe / n as f64).exp() as f32;
+        let (warm_kalt, gruen_magenta) = if nn > 200 {
+            ((rb / nn as f64) as f32, (gm / nn as f64) as f32)
+        } else {
+            (0.0, 0.0)
+        };
+        Messwerte {
+            helligkeit_ev: (mittel.max(1e-4) / 0.18).log2(),
+            lichter_prozent: hell as f32 * 100.0 / n as f32,
+            warm_kalt,
+            gruen_magenta,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Regeln
+// ---------------------------------------------------------------------------
+
+/// Aenderungen gegenueber der Automatik.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Zuschlag {
+    pub exposure: f32,
+    pub contrast: f32,
+    pub highlights: f32,
+    pub shadows: f32,
+    pub whites: f32,
+    pub blacks: f32,
+    pub temp: f32,
+    pub tint: f32,
+    pub vibrance: f32,
+    pub saturation: f32,
+    pub clarity: f32,
+    pub dehaze: f32,
+    pub texture: f32,
+}
+
+impl Zuschlag {
+    #[allow(clippy::too_many_arguments)]
+    const fn neu(contrast: f32, highlights: f32, shadows: f32, whites: f32, blacks: f32, vibrance: f32, saturation: f32, clarity: f32, dehaze: f32, texture: f32) -> Zuschlag {
+        Zuschlag { exposure: 0.0, contrast, highlights, shadows, whites, blacks, temp: 0.0, tint: 0.0, vibrance, saturation, clarity, dehaze, texture }
+    }
+    fn plus(mut self, o: Zuschlag) -> Zuschlag {
+        self.exposure += o.exposure;
+        self.contrast += o.contrast;
+        self.highlights += o.highlights;
+        self.shadows += o.shadows;
+        self.whites += o.whites;
+        self.blacks += o.blacks;
+        self.temp += o.temp;
+        self.tint += o.tint;
+        self.vibrance += o.vibrance;
+        self.saturation += o.saturation;
+        self.clarity += o.clarity;
+        self.dehaze += o.dehaze;
+        self.texture += o.texture;
+        self
+    }
+    fn mal(mut self, f: f32) -> Zuschlag {
+        for v in [
+            &mut self.exposure, &mut self.contrast, &mut self.highlights, &mut self.shadows, &mut self.whites,
+            &mut self.blacks, &mut self.temp, &mut self.tint, &mut self.vibrance, &mut self.saturation,
+            &mut self.clarity, &mut self.dehaze, &mut self.texture,
+        ] {
+            *v *= f;
+        }
+        self
+    }
+}
+
+/// Grundlook je Szene: Kontrast, Lichter, Tiefen, Weiss, Schwarz, Dynamik,
+/// Saettigung, Klarheit, Dunst entfernen, Struktur.
+fn szene_zuschlag(szene: &str) -> Zuschlag {
+    match szene {
+        "portrait" => Zuschlag::neu(3.0, -6.0, 8.0, 3.0, -3.0, 3.0, 0.0, -6.0, 0.0, -8.0),
+        "group_of_people" => Zuschlag::neu(4.0, -6.0, 8.0, 3.0, -3.0, 4.0, 0.0, 2.0, 0.0, 0.0),
+        "event_or_party_indoors" => Zuschlag::neu(4.0, -6.0, 10.0, 5.0, -3.0, 3.0, 0.0, 3.0, 0.0, 0.0),
+        "interior_room" => Zuschlag::neu(4.0, -8.0, 10.0, 5.0, -3.0, 3.0, 0.0, 4.0, 0.0, 2.0),
+        "landscape" => Zuschlag::neu(6.0, -10.0, 6.0, 4.0, -5.0, 14.0, 3.0, 8.0, 5.0, 6.0),
+        "city_or_architecture" => Zuschlag::neu(8.0, -8.0, 6.0, 4.0, -6.0, 6.0, 0.0, 10.0, 3.0, 8.0),
+        "sunset_or_sunrise" => Zuschlag::neu(6.0, -12.0, 5.0, 0.0, -5.0, 12.0, 5.0, 4.0, 4.0, 0.0),
+        "night" => Zuschlag::neu(5.0, -10.0, 3.0, 0.0, -8.0, 5.0, 0.0, 4.0, 0.0, 0.0),
+        "food_or_still_life" => Zuschlag::neu(5.0, -6.0, 5.0, 4.0, -4.0, 10.0, 3.0, 4.0, 0.0, 8.0),
+        "nature_closeup" => Zuschlag::neu(5.0, -6.0, 5.0, 3.0, -4.0, 12.0, 2.0, 4.0, 0.0, 10.0),
+        "beach_or_snow" => Zuschlag::neu(3.0, -10.0, 3.0, 3.0, -4.0, 8.0, 0.0, 4.0, 3.0, 0.0),
+        "aerial_view" => Zuschlag::neu(6.0, -6.0, 5.0, 3.0, -5.0, 10.0, 0.0, 8.0, 8.0, 6.0),
+        _ => Zuschlag::neu(5.0, -10.0, 8.0, 4.0, -5.0, 8.0, 0.0, 4.0, 0.0, 0.0),
+    }
+}
+
+fn look_zuschlag(look: &str) -> Zuschlag {
+    let mut z = match look {
+        "vivid" => Zuschlag::neu(4.0, 0.0, 0.0, 0.0, 0.0, 8.0, 4.0, 3.0, 0.0, 0.0),
+        "soft" => Zuschlag::neu(-6.0, -5.0, 0.0, 0.0, 0.0, 0.0, 0.0, -6.0, 0.0, -4.0),
+        "dramatic" => Zuschlag::neu(10.0, 0.0, 0.0, 0.0, -6.0, 4.0, 0.0, 8.0, 4.0, 0.0),
+        _ => Zuschlag::default(),
     };
+    match look {
+        "warm" => z.temp = 3.0,
+        "cool" => z.temp = -5.0,
+        _ => {}
+    }
+    z
+}
 
-    let text = resp
-        .body_mut()
-        .read_to_string()
-        .map_err(|e| AiError::Net(e.to_string()))?;
-    let outer: serde_json::Value = serde_json::from_str(&text).map_err(|_| AiError::Parse)?;
+/// Die Regeln: Einordnung + Messung -> Zuschlag auf die Automatik.
+pub fn zuschlag(e: &Einordnung, m: &Messwerte, staerke: Strength) -> Zuschlag {
+    let f = staerke.faktor();
+    let mut z = szene_zuschlag(e.szene).plus(look_zuschlag(e.look));
+    if e.dunst {
+        z = z.plus(Zuschlag { dehaze: 10.0, contrast: 4.0, ..Default::default() });
+    }
+    if e.himmel == "large_part" {
+        z = z.plus(Zuschlag { highlights: -5.0, dehaze: 3.0, ..Default::default() });
+    }
+    if e.licht == "backlight" && e.menschen != "none" {
+        z = z.plus(Zuschlag { shadows: 12.0, ..Default::default() });
+    }
+    z = z.mal(f);
+    // Gesichter: keine harte Struktur, gleich bei welcher Staerke.
+    if e.menschen == "prominent_faces" {
+        z.clarity = z.clarity.min(0.0);
+        z.texture = z.texture.min(0.0);
+    }
+    // Helligkeit: die Automatik ist an echten fertigen Entwicklungen gelernt und
+    // trifft sie gut. Das Modell darf sie nur verschieben, wenn die Messung es
+    // KLAR bestaetigt — gemessen hat es „zu hell" auch bei richtig belichteten
+    // Fotos gesagt und sie damit abgedunkelt.
+    let ev = m.helligkeit_ev;
+    let belichtung: f32 = match e.helligkeit {
+        "too_dark" if ev < -1.7 => 15.0,
+        "too_bright" if ev > -0.4 => -15.0,
+        _ => 0.0,
+    };
+    z.exposure += if e.szene == "night" { belichtung.min(5.0) } else { belichtung } * f.min(1.2);
+    // Ausgefressene Lichter: gemessen, nicht geschaetzt.
+    if m.lichter_prozent > 1.0 {
+        z.highlights -= (m.lichter_prozent * 3.0).min(10.0);
+    }
+    // Der ganze Lichter-Zuschlag bleibt maessig: mehrere Regeln addierten sich
+    // gemessen auf -45, das Foto wurde flau und dunkel.
+    z.highlights = z.highlights.max(-15.0 * f.max(1.0));
+    // Farbstich nur, wenn Modell und Messung dieselbe Richtung sehen. Halbe
+    // Korrektur: ~0,36 R-B-Punkte je Regler-Einheit (Kalibrierung der Grundwaerme).
+    let licht_gewollt_warm = matches!(e.licht, "golden_hour" | "warm_indoor_light") || e.szene == "sunset_or_sunrise";
+    match e.stich {
+        "too_warm_yellow" if m.warm_kalt > 4.0 && !licht_gewollt_warm => {
+            z.temp -= (m.warm_kalt / 0.36 * 0.5).clamp(4.0, 15.0);
+        }
+        "too_cool_blue" if m.warm_kalt < -4.0 => {
+            z.temp += (-m.warm_kalt / 0.36 * 0.5).clamp(4.0, 15.0);
+        }
+        "too_green" if m.gruen_magenta > 3.0 => z.tint += (m.gruen_magenta * 1.5).clamp(3.0, 10.0),
+        "too_magenta" if m.gruen_magenta < -3.0 => z.tint -= (-m.gruen_magenta * 1.5).clamp(3.0, 10.0),
+        _ => {}
+    }
+    z
+}
 
-    // Der Server antwortet {"ok":true,"text":"…"} — im Text steckt das eigentliche JSON.
-    let inner_text = outer
-        .get("text")
-        .and_then(|v| v.as_str())
-        .ok_or(AiError::Parse)?;
-    let json = extract_json(inner_text).ok_or(AiError::Parse)?;
+fn anwenden(basis: &Edit, z: &Zuschlag) -> Edit {
+    let mut e = basis.clone();
+    let k = |v: f32| v.clamp(-100.0, 100.0);
+    e.exposure = k(e.exposure + z.exposure);
+    e.contrast = k(e.contrast + z.contrast);
+    e.highlights = k(e.highlights + z.highlights);
+    e.shadows = k(e.shadows + z.shadows);
+    e.whites = k(e.whites + z.whites);
+    e.blacks = k(e.blacks + z.blacks);
+    e.temp = k(e.temp + z.temp);
+    e.tint = k(e.tint + z.tint);
+    e.vibrance = k(e.vibrance + z.vibrance);
+    e.saturation = k(e.saturation + z.saturation);
+    e.clarity = k(e.clarity + z.clarity);
+    e.dehaze = k(e.dehaze + z.dehaze);
+    e.texture = k(e.texture + z.texture);
+    e
+}
 
-    let mut edit = base_edit.clone();
-    let applied = edit.merge_json(&json);
+/// Rechnet einen Bearbeitungsstand klein durch (RGBA, Breite, Hoehe) — zum
+/// Nachmessen der Helligkeit.
+pub type Probe<'a> = &'a dyn Fn(&Edit) -> Option<(Vec<u8>, u32, u32)>;
 
-    // Untergrenze fuer die Aufnahme-Grundeinstellungen.
-    //
-    // Die KI beurteilt ein 1200-px-Vorschaubild. Auf dieser Groesse ist eine
-    // Schaerfung mit einem Pixel Radius schlicht nicht zu sehen — sie kann also
-    // gar nicht sinnvoll darueber entscheiden und hat sie regelmaessig gesenkt
-    // (38 -> 25) und damit die Grundschaerfung wieder weggenommen. Anheben darf
-    // sie weiterhin; senken nicht. Was dabei zurechtgerueckt wurde, steht im
-    // Protokoll — heimlich uebergehen waere schlimmer als der Fehler selbst.
+/// Fragt die lokale KI und gibt die entwickelten Regler zurück.
+///
+/// `base_edit` ist der aktuelle Stand (in der Regel die Automatik) — die KI legt
+/// ihren Look obendrauf. Mit `probe` wird das Ergebnis nachgemessen (siehe
+/// `nachmessen`).
+pub fn develop(rgba: &[u8], width: u32, height: u32, base_edit: &Edit, strength: Strength, probe: Option<Probe>) -> Result<AiResult, AiError> {
+    let jpeg = encode_small_jpeg(rgba, width, height, 896)?;
+    let mess = Messwerte::aus(rgba, width, height);
+    let beschreibung = crate::ki_lokal::fragen(&jpeg, &[], FRAGE_BESCHREIBEN, 160).map_err(AiError::Dienst)?;
+    let frage2 = frage_einordnen();
+    let roh = crate::ki_lokal::fragen(&jpeg, &[(FRAGE_BESCHREIBEN, &beschreibung)], &frage2, 240)
+        .map_err(AiError::Dienst)?;
+    let einordnung = Einordnung::lesen(&roh).ok_or_else(|| AiError::Dienst(t("Antwort ließ sich nicht einordnen").into()))?;
+    let mut r = develop_mit(base_edit, &einordnung, &mess, strength, format!("{beschreibung}\n\n{roh}"));
+    if let Some(probe) = probe {
+        if let Some(text) = nachmessen(&mut r.edit, base_edit, probe) {
+            r.zurechtgerueckt.push(text);
+            r.geaendert = unterschiede(base_edit, &r.edit);
+        }
+    }
+    Ok(r)
+}
+
+/// Der Look (Lichter, Tiefen, Schwarz, Kontrast) verschiebt nebenbei die mittlere
+/// Helligkeit — gemessen bis 0,5 EV dunkler als gewollt. Deshalb wird das
+/// Ergebnis klein durchgerechnet und die Belichtung so nachgefuehrt, dass die
+/// Helligkeit dort liegt, wo Automatik plus gewollte Aenderung sie hinlegen.
+fn nachmessen(edit: &mut Edit, basis: &Edit, probe: Probe) -> Option<String> {
+    // Ziel mit DERSELBEN Probe messen wie das Ergebnis (gleiche Groesse, gleicher
+    // Weg). 50 Reglereinheiten = 1 Blende.
+    let (px, w, h) = probe(basis)?;
+    let ziel = Messwerte::aus(&px, w, h).helligkeit_ev + (edit.exposure - basis.exposure) / 50.0;
+    let start = edit.exposure;
+    for _ in 0..2 {
+        let (px, w, h) = probe(edit)?;
+        let ist = Messwerte::aus(&px, w, h).helligkeit_ev;
+        let fehler = ziel - ist;
+        if fehler.abs() < 0.04 {
+            break;
+        }
+        edit.exposure = (edit.exposure + fehler * 50.0).clamp(start - 30.0, start + 30.0);
+    }
+    ((edit.exposure - start).abs() >= 0.5).then(|| {
+        tf("exposure: {} -> {} (Helligkeit nachgemessen)", &[&format!("{start:.0}"), &format!("{:.0}", edit.exposure)])
+    })
+}
+
+/// Der Teil nach dem Modell — getrennt, damit er sich ohne Modell pruefen laesst.
+pub fn develop_mit(base_edit: &Edit, einordnung: &Einordnung, mess: &Messwerte, strength: Strength, roh: String) -> AiResult {
+    let z = zuschlag(einordnung, mess, strength);
+    let mut edit = anwenden(base_edit, &z);
     let mut zurechtgerueckt = Vec::new();
     let mut grenze = |name: &str, wert: &mut f32, mindestens: f32| {
         if *wert < mindestens - 0.01 {
@@ -276,45 +576,17 @@ pub fn develop(
         ));
         edit.grade_shadow_sat = 0.0;
     }
-    // Was hat sich wirklich bewegt? Die KI nennt oft Werte, die schon so standen —
-    // „25 Regler gesetzt" saehe dann nach viel Arbeit aus, wo nichts passierte.
     let geaendert = unterschiede(base_edit, &edit);
-    Ok(AiResult {
+    AiResult {
+        applied: geaendert.iter().map(|g| g.split(':').next().unwrap_or_default().to_string()).collect(),
         edit,
-        applied,
-        roh: serde_json::to_string_pretty(&json).unwrap_or_else(|_| inner_text.to_string()),
+        roh,
         geaendert,
         zurechtgerueckt,
-        scene_label: json
-            .get("sceneLabel")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string(),
-        look: json
-            .get("look")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string(),
-        description: json
-            .get("description")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string(),
-    })
-}
-
-/// Modelle packen ihre Antwort gern in Fließtext oder Code-Zäune. Wir schneiden das
-/// äußerste geschweifte Klammernpaar heraus, statt auf sauberes JSON zu hoffen.
-fn extract_json(s: &str) -> Option<serde_json::Value> {
-    if let Ok(v) = serde_json::from_str::<serde_json::Value>(s.trim()) {
-        return Some(v);
+        scene_label: szene_text(einordnung.szene).to_string(),
+        look: look_text(einordnung.look).to_string(),
+        description: einordnung.beschreibung.clone(),
     }
-    let start = s.find('{')?;
-    let end = s.rfind('}')?;
-    if end <= start {
-        return None;
-    }
-    serde_json::from_str(&s[start..=end]).ok()
 }
 
 /// Verkleinert und kodiert das Bild für die Anfrage. Kein volles 40-MP-Bild ins Netz:
@@ -343,7 +615,7 @@ fn encode_small_jpeg(
     Ok(out.into_inner())
 }
 
-fn base64_encode(data: &[u8]) -> String {
+pub(crate) fn base64_encode(data: &[u8]) -> String {
     const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
@@ -378,13 +650,6 @@ mod tests {
         assert_eq!(base64_encode(b"Foto"), "Rm90bw==");
         assert_eq!(base64_encode(b"RAW"), "UkFX");
         assert_eq!(base64_encode(b"a"), "YQ==");
-    }
-
-    #[test]
-    fn json_aus_fliesstext() {
-        let v = extract_json("Hier ist das Ergebnis:\n```json\n{\"exposure\": 5}\n```\nViel Spaß")
-            .unwrap();
-        assert_eq!(v["exposure"], 5);
     }
 }
 
@@ -449,5 +714,117 @@ mod unterschied_tests {
     fn gleichstand_ergibt_leere_liste() {
         let a = Edit::default();
         assert!(unterschiede(&a, &a.clone()).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod lokal_tests {
+    use super::*;
+
+    #[test]
+    fn einordnung_liest_auch_kaputtes_json() {
+        // So kam es gemessen vom Modell: `\"` vor dem Doppelpunkt.
+        let roh = r#"{"scene":"landscape","light":"direct_sun","people":"none","sky":"large_part","haze":"no","brightness":"slightly_dark","colour_cast":"none_or_intended","look":"natural","description_de\":\"Eine ruhige Flusslandschaft.\"}"#;
+        let e = Einordnung::lesen(roh).unwrap();
+        assert_eq!(e.szene, "landscape");
+        assert_eq!(e.himmel, "large_part");
+        assert_eq!(e.helligkeit, "slightly_dark");
+        assert!(!e.dunst);
+        assert_eq!(e.beschreibung, "Eine ruhige Flusslandschaft.");
+    }
+
+    #[test]
+    fn beschreibung_unter_neuem_schluessel() {
+        let roh = r#"{"scene":"night","description":"A quiet street at night."}"#;
+        assert_eq!(Einordnung::lesen(roh).unwrap().beschreibung, "A quiet street at night.");
+    }
+
+    #[test]
+    fn ohne_szene_gibt_es_keine_einordnung() {
+        assert!(Einordnung::lesen("Ich sehe ein Foto.").is_none());
+    }
+
+    fn einordnung(szene: &'static str) -> Einordnung {
+        Einordnung {
+            szene,
+            licht: "direct_sun",
+            menschen: "none",
+            himmel: "none",
+            dunst: false,
+            helligkeit: "right",
+            stich: "none_or_intended",
+            look: "natural",
+            beschreibung: String::new(),
+        }
+    }
+
+    const MITTEL: Messwerte = Messwerte { helligkeit_ev: -0.9, lichter_prozent: 0.2, warm_kalt: 0.0, gruen_magenta: 0.0 };
+
+    #[test]
+    fn landschaft_wird_lebendiger_als_ein_portraet() {
+        let l = zuschlag(&einordnung("landscape"), &MITTEL, Strength::Normal);
+        let p = zuschlag(&einordnung("portrait"), &MITTEL, Strength::Normal);
+        assert!(l.vibrance > p.vibrance && l.clarity > p.clarity);
+    }
+
+    #[test]
+    fn staerke_skaliert_den_look() {
+        let s = zuschlag(&einordnung("landscape"), &MITTEL, Strength::Sanft);
+        let k = zuschlag(&einordnung("landscape"), &MITTEL, Strength::Kraeftig);
+        assert!(k.vibrance > s.vibrance * 2.0);
+    }
+
+    #[test]
+    fn helligkeit_nur_wenn_die_messung_zustimmt() {
+        let mut e = einordnung("landscape");
+        e.helligkeit = "too_dark";
+        let hell = Messwerte { helligkeit_ev: -0.2, ..MITTEL };
+        assert_eq!(zuschlag(&e, &hell, Strength::Normal).exposure, 0.0, "Modell irrt, Bild ist hell");
+        let dunkel = Messwerte { helligkeit_ev: -2.0, ..MITTEL };
+        assert!(zuschlag(&e, &dunkel, Strength::Normal).exposure > 0.0);
+    }
+
+    #[test]
+    fn gewolltes_warmes_licht_bleibt_warm() {
+        let mut e = einordnung("sunset_or_sunrise");
+        e.stich = "too_warm_yellow";
+        let warm = Messwerte { warm_kalt: 20.0, ..MITTEL };
+        assert!(zuschlag(&e, &warm, Strength::Normal).temp >= 0.0);
+    }
+
+    #[test]
+    fn gesichter_bekommen_keine_harte_struktur() {
+        let mut e = einordnung("city_or_architecture");
+        e.menschen = "prominent_faces";
+        let z = zuschlag(&e, &MITTEL, Strength::Kraeftig);
+        assert!(z.clarity <= 0.0 && z.texture <= 0.0);
+    }
+
+    #[test]
+    fn ausgefressene_lichter_werden_zurueckgenommen() {
+        let e = einordnung("other");
+        let hell = Messwerte { lichter_prozent: 4.0, ..MITTEL };
+        assert!(zuschlag(&e, &hell, Strength::Normal).highlights < zuschlag(&e, &MITTEL, Strength::Normal).highlights - 4.0);
+    }
+
+    #[test]
+    fn leitplanken_gelten_weiter() {
+        let mut basis = Edit::default();
+        basis.vibrance = 30.0;
+        let mut e = einordnung("portrait");
+        e.look = "soft";
+        let r = develop_mit(&basis, &e, &MITTEL, Strength::Kraeftig, String::new());
+        assert!(r.edit.vibrance >= 30.0, "Grundfarbkraft darf nicht sinken");
+        assert!(r.edit.clarity <= 18.0);
+    }
+
+    #[test]
+    fn messwerte_eines_grauen_bildes() {
+        let px = vec![128u8; 64 * 64 * 4];
+        let m = Messwerte::aus(&px, 64, 64);
+        assert!(m.lichter_prozent == 0.0);
+        assert!(m.warm_kalt.abs() < 0.01);
+        // sRGB 128 = 21,6 % linear -> knapp ueber Mittelgrau
+        assert!((m.helligkeit_ev - 0.26).abs() < 0.05, "{}", m.helligkeit_ev);
     }
 }

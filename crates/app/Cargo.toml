@@ -13,6 +13,8 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 pollster = "0.4"
 serde_json = "1"
 ureq = { version = "3", features = ["json"] }
+# Pruefsummen der KI-Downloads.
+sha2 = "0.11"
 # Systemsprache fuer die Wahl Deutsch/Englisch (MIT oder Apache-2.0, auf
 # allen drei Zielsystemen ohne weitere Abhaengigkeiten).
 sys-locale = "0.3"

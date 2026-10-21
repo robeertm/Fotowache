@@ -221,6 +221,109 @@ pub fn monitor_text(gpu: &pipeline::Gpu) -> String {
     }
 }
 
+/// Eine Zahl mit `stellen` Nachkommastellen im Format der Oberflaeche
+/// (Deutsch mit Komma).
+pub fn zahl(v: f32, stellen: usize) -> String {
+    let s = format!("{v:.stellen$}");
+    match aktuell() {
+        Sprache::De => s.replace('.', ","),
+        Sprache::En => s,
+    }
+}
+
+/// Fortschrittsschritt des Panorama-Kerns.
+pub fn panorama_schritt(s: pipeline::panorama::Schritt) -> String {
+    use pipeline::panorama::Schritt as S;
+    match s {
+        S::Merkmale => t("Merkmale suchen"),
+        S::Zuordnen => t("Fotos zuordnen"),
+        S::Ausrichten => t("Ausrichten"),
+        S::Feinausrichtung => t("Feinausrichtung"),
+        S::Parallaxe => t("Parallaxe ausgleichen"),
+        S::Naehte => t("Nähte suchen"),
+        S::Mischen => t("Mischen"),
+        S::Fertig => t("Fertig"),
+    }
+    .to_string()
+}
+
+/// Warum ein Panorama nicht entstehen konnte.
+pub fn panorama_fehler(e: &pipeline::panorama::PanoramaFehler) -> String {
+    use pipeline::panorama::PanoramaFehler as E;
+    match e {
+        E::ZuWenigBilder => t("Für ein Panorama mindestens zwei Fotos auswählen.").to_string(),
+        E::UngueltigeAbmessungen(k) => tf("Foto {} hat ungültige Abmessungen.", &[&(k + 1)]),
+        E::KeineUeberlappung => t("Keine zwei Fotos überlappen erkennbar — ein Panorama braucht etwa 20–50 % Überlappung zwischen Nachbarfotos.").to_string(),
+        E::NichtAusrichtbar => t("Die Fotos ließen sich nicht widerspruchsfrei ausrichten.").to_string(),
+        E::ProjektionUngeeignet => t("Die Projektion kann diese Anordnung nicht darstellen — bitte Zylinder oder Kugel wählen.").to_string(),
+        E::AusserhalbProjektion => t("Ein Foto liegt außerhalb der darstellbaren Fläche — bitte eine andere Projektion wählen.").to_string(),
+    }
+}
+
+/// Der Bericht des Panorama-Kerns, eine Zeile je Meldung.
+pub fn panorama_bericht(bericht: &[pipeline::panorama::Meldung]) -> String {
+    use pipeline::panorama::{Meldung as M, Projektion as P, Verwerfgrund as G};
+    let zeile = |m: &M| -> String {
+        match m {
+            M::Verwendet { genutzt, von } => tf("Panorama aus {} von {} Fotos.", &[genutzt, von]),
+            M::Verworfen { bild, grund } => {
+                let g = match grund {
+                    G::KeinPartner { hoechstens_punkte: 0 } => t("passt zu keinem anderen Foto (keine übereinstimmenden Punkte)").to_string(),
+                    G::KeinPartner { hoechstens_punkte } => {
+                        tf("passt zu keinem anderen Foto (höchstens {} übereinstimmende Punkte)", &[hoechstens_punkte])
+                    }
+                    G::ZweiteGruppe => t("gehört zu einer zweiten, getrennten Gruppe").to_string(),
+                    G::LageWiderspruechlich => t("Lage widerspricht den übrigen Fotos").to_string(),
+                };
+                tf("Weggelassen: Foto {} – {}.", &[&(bild + 1), &g])
+            }
+            M::Ausrichtung { fehler_px, punktpaare, prozent_nachgefuehrt } => tf(
+                "Mittlerer Ausrichtungsfehler: {} px ({} Punktpaare, {} % auf voller Auflösung nachgeführt).",
+                &[&zahl(*fehler_px, 2), punktpaare, prozent_nachgefuehrt],
+            ),
+            M::Brennweite { px, aus_metadaten } => tf(
+                "Brennweite: {} px ({}).",
+                &[&zahl(*px, 0), &if *aus_metadaten { t("aus den Metadaten, nachgeregelt") } else { t("geschätzt") }],
+            ),
+            M::BrennweiteFestgelegt => t("Hinweis: Die Fotos passen nicht zu einem festen Standpunkt (geschätzte Brennweite unplausibel) — Brennweite aus den Metadaten festgehalten, Versatz möglich.").to_string(),
+            M::Massstab { bild, faktor, groesser: true } => tf(
+                "Hinweis: Foto {} erscheint {}-fach größer als die übrigen (anderer Zoom oder anderer Standort).",
+                &[&(bild + 1), &zahl(*faktor, 2)],
+            ),
+            M::Massstab { bild, faktor, groesser: false } => tf(
+                "Hinweis: Foto {} erscheint {}-fach kleiner als die übrigen (anderer Zoom oder anderer Standort).",
+                &[&(bild + 1), &zahl(*faktor, 2)],
+            ),
+            M::Verzeichnung { tonne: true, prozent } => {
+                tf("Objektivverzeichnung ausgeglichen (Tonne, {} % in den Bildecken).", &[&zahl(*prozent, 1)])
+            }
+            M::Verzeichnung { tonne: false, prozent } => {
+                tf("Objektivverzeichnung ausgeglichen (Kissen, {} % in den Bildecken).", &[&zahl(*prozent, 1)])
+            }
+            M::Belichtung { von, bis } => tf("Helligkeit angeglichen: Verstärkung {} bis {}.", &[&zahl(*von, 2), &zahl(*bis, 2)]),
+            M::Parallaxe { vorher_px, nachher_px, .. } => tf(
+                "Parallaxe ausgeglichen: Versatz an den Nähten {} px statt {} px.",
+                &[&zahl(*nachher_px, 1), &zahl(*vorher_px, 1)],
+            ),
+            M::Projektion { projektion, w, h, verkleinert_prozent } => {
+                let name = match projektion {
+                    P::Zylinder => t("Zylinder"),
+                    P::Kugel => t("Kugel"),
+                    P::Eben => t("Eben"),
+                };
+                match verkleinert_prozent {
+                    Some(p) => tf("Projektion: {}, {} × {} px (auf {} % verkleinert).", &[&name, w, h, &zahl(*p, 0)]),
+                    None => tf("Projektion: {}, {} × {} px.", &[&name, w, h]),
+                }
+            }
+            M::Beschnitten => {
+                t("Hinweis: Der Bildwinkel übersteigt, was diese Projektion darstellen kann; die Ränder sind abgeschnitten.").to_string()
+            }
+        }
+    };
+    bericht.iter().map(zeile).collect::<Vec<_>>().join("\n")
+}
+
 /// Namen der Kameraprofile, die die Farbkette selbst vergibt (alle anderen
 /// kommen aus installierten Kameraprofilen (DCP) oder DNG-Dateien und bleiben,
 /// wie sie sind).
@@ -236,11 +339,16 @@ pub(crate) mod pruefung {
     pub(crate) const QUELLEN: &[(&str, &str)] = &[
         ("ai.rs", include_str!("ai.rs")),
         ("export.rs", include_str!("export.rs")),
+        ("generator.rs", include_str!("generator.rs")),
         ("grundpanel.rs", include_str!("grundpanel.rs")),
+        ("ki_lokal.rs", include_str!("ki_lokal.rs")),
         ("main.rs", include_str!("main.rs")),
         ("ordner.rs", include_str!("ordner.rs")),
+        ("panorama.rs", include_str!("panorama.rs")),
         ("presets.rs", include_str!("presets.rs")),
         ("sprache.rs", include_str!("sprache.rs")),
+        ("updater.rs", include_str!("updater.rs")),
+        ("zusatz.rs", include_str!("zusatz.rs")),
     ];
 
     /// Die englische Tabelle, fuer die Schriftzeichen-Pruefung in `main.rs`.

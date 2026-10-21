@@ -22,11 +22,14 @@ pub mod color;
 pub mod dcp;
 pub mod exif;
 pub mod heal;
+pub mod heal_ki;
+pub mod zusatz;
 pub mod icc;
 pub mod xmp;
 pub mod monitor;
 pub mod objektiv;
 pub mod objektivdaten;
+pub mod panorama;
 pub mod params;
 
 use params::Edit;
@@ -439,6 +442,18 @@ struct Zwischen {
 }
 
 /// Ein geladenes Bild auf der GPU.
+/// Ergebnis von `GpuImage::kachelweise`.
+pub enum Gerendert {
+    /// 8 Bit, RGBA verschraenkt (wie `render`).
+    Rgba8 { w: u32, h: u32, px: Vec<u8> },
+    /// 16 Bit, RGB verschraenkt (wie `render16`).
+    Rgb16 { w: u32, h: u32, px: Vec<u16> },
+}
+
+/// Bis zu dieser Kante wird ein Bild in einem Stueck entwickelt; darueber in
+/// Kacheln (Texturgrenze 16384, Rueckholpuffer, Speicher der Grafikkarte).
+pub const KACHEL_KANTE: u32 = 8192;
+
 pub struct GpuImage {
     pub width: u32,
     pub height: u32,
@@ -481,7 +496,7 @@ impl GpuImage {
         img: &rawcore::RawImage,
         max_dim: Option<u32>,
     ) -> Result<Self, GpuError> {
-        Self::upload_mit(gpu, img, max_dim, &[])
+        Self::upload_mit(gpu, img, max_dim, &Retusche::LEER)
     }
 
     /// Wie `upload`, aber schliesst vorher die markierten Stellen.
@@ -494,9 +509,9 @@ impl GpuImage {
         gpu: &Gpu,
         img: &rawcore::RawImage,
         max_dim: Option<u32>,
-        heal_spots: &[[f32; 3]],
+        retusche: &Retusche,
     ) -> Result<Self, GpuError> {
-        let (w, h, data) = Self::vorbereiten(img, max_dim, heal_spots)?;
+        let (w, h, data) = Self::vorbereiten(img, max_dim, retusche)?;
         let quelle = Arc::new(basis::BasisQuelle::aus_f16(&data, w, h));
         let massstab = w as f32 / img.width.max(1) as f32;
         Self::from_f16(gpu, w, h, &data, &img.meta, Some(quelle), massstab)
@@ -510,15 +525,13 @@ impl GpuImage {
     pub fn vorbereiten(
         img: &rawcore::RawImage,
         max_dim: Option<u32>,
-        heal_spots: &[[f32; 3]],
+        retusche: &Retusche,
     ) -> Result<(u32, u32, Vec<u16>), GpuError> {
         if img.width == 0 || img.height == 0 {
             return Err(GpuError::Empty);
         }
         let (w, h, mut data) = to_rgba_f16(img, max_dim);
-        if !heal_spots.is_empty() {
-            heal::anwenden(&mut data, w, h, &heal::aus_edit(heal_spots, w, h));
-        }
+        retusche.anwenden(&mut data, w, h);
         Ok((w, h, data))
     }
 
@@ -648,7 +661,7 @@ impl GpuImage {
         w: u32,
         h: u32,
     ) -> Result<Self, GpuError> {
-        Self::upload_region_mit(gpu, img, x, y, w, h, &[])
+        Self::upload_region_mit(gpu, img, x, y, w, h, &Retusche::LEER)
     }
 
     /// Wie `upload_region`, schliesst aber die markierten Stellen mit.
@@ -661,7 +674,7 @@ impl GpuImage {
         y: u32,
         w: u32,
         h: u32,
-        heal_spots: &[[f32; 3]],
+        retusche: &Retusche,
     ) -> Result<Self, GpuError> {
         let w = w.min(img.width.saturating_sub(x)).max(1);
         let h = h.min(img.height.saturating_sub(y)).max(1);
@@ -683,9 +696,7 @@ impl GpuImage {
                 data[o + 3] = one;
             }
         }
-        if !heal_spots.is_empty() {
-            heal::anwenden(&mut data, w, h, &heal::aus_edit(heal_spots, w, h));
-        }
+        retusche.anwenden(&mut data, w, h);
         Self::from_f16(gpu, w, h, &data, &img.meta, None, 1.0)
     }
 
@@ -1014,13 +1025,21 @@ impl GpuImage {
         let mut enc = gpu
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        // Zwei getrennte Durchgaenge: die Ausgabe liest die Zwischentextur, die
+        // die Entwicklung schreibt. Im selben Durchgang lasen einzelne
+        // Arbeitsgruppen gelegentlich noch alte Werte — gemessen: zwei Laeufe
+        // desselben Fotos unterschieden sich in duennen Zeilenbaendern um bis zu
+        // 20/255. Mit Durchgangsgrenze sind sie bitgleich.
+        let gx = self.width.div_ceil(8);
+        let gy = self.height.div_ceil(8);
         {
             let mut pass = enc.begin_compute_pass(&Default::default());
-            let gx = self.width.div_ceil(8);
-            let gy = self.height.div_ceil(8);
             pass.set_pipeline(&gpu.develop);
             pass.set_bind_group(0, &g1, &[]);
             pass.dispatch_workgroups(gx, gy, 1);
+        }
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
             pass.set_pipeline(pipe2);
             pass.set_bind_group(0, &g2, &[]);
             pass.dispatch_workgroups(gx, gy, 1);
@@ -1030,46 +1049,127 @@ impl GpuImage {
 
     fn render_to(&self, gpu: &Gpu, edit: &Edit, ziel: Ziel) -> Vec<u8> {
         let v_dst = self.dst.create_view(&Default::default());
-        let mut enc = self.durchgaenge(gpu, edit, ziel, false, &v_dst);
+        let enc = self.durchgaenge(gpu, edit, ziel, false, &v_dst);
 
-        // Zurueckholen: die Zeilenlaenge muss auf 256 Byte ausgerichtet sein.
+        gpu.queue.submit(Some(enc.finish()));
+
+        // Zurueckholen in Baendern (Zeilenlaenge auf 256 Byte ausgerichtet): ein
+        // Panorama ueber ~67 MP braucht als RGBA mehr als die 256 MB, die die
+        // Grafikkarte in EINEM Puffer erlaubt — gemessen: Absturz bei 274 MB.
         let padded = (self.width * 4).div_ceil(256) * 256;
-        let out_buf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+        let max_bytes: u64 = 192 << 20;
+        let rows_per_band = ((max_bytes / padded.max(1) as u64).max(1) as u32).min(self.height);
+        let band_buf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("rueckhol"),
-            size: (padded as u64) * (self.height as u64),
+            size: padded as u64 * rows_per_band as u64,
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
-        enc.copy_texture_to_buffer(
-            self.dst.as_image_copy(),
-            wgpu::TexelCopyBufferInfo {
-                buffer: &out_buf,
-                layout: wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(padded),
-                    rows_per_image: Some(self.height),
-                },
-            },
-            extent(self.width, self.height),
-        );
-        gpu.queue.submit(Some(enc.finish()));
-
-        let slice = out_buf.slice(..);
-        slice.map_async(wgpu::MapMode::Read, |_| {});
-        let _ = gpu.device.poll(wgpu::PollType::Wait {
-            submission_index: None,
-            timeout: None,
-        });
-        let mapped = slice.get_mapped_range();
         let row = (self.width * 4) as usize;
         let mut out = vec![0u8; row * self.height as usize];
-        for y in 0..self.height as usize {
-            let s = y * padded as usize;
-            out[y * row..(y + 1) * row].copy_from_slice(&mapped[s..s + row]);
+        let mut y0 = 0u32;
+        while y0 < self.height {
+            let rows = rows_per_band.min(self.height - y0);
+            let mut e = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+            e.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &self.dst,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d { x: 0, y: y0, z: 0 },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &band_buf,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(padded),
+                        rows_per_image: Some(rows),
+                    },
+                },
+                extent(self.width, rows),
+            );
+            gpu.queue.submit(Some(e.finish()));
+            let slice = band_buf.slice(..(padded as u64 * rows as u64));
+            slice.map_async(wgpu::MapMode::Read, |_| {});
+            let _ = gpu.device.poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: None,
+            });
+            let mapped = slice.get_mapped_range();
+            for r in 0..rows as usize {
+                let s = r * padded as usize;
+                let z = (y0 as usize + r) * row;
+                out[z..z + row].copy_from_slice(&mapped[s..s + row]);
+            }
+            drop(mapped);
+            band_buf.unmap();
+            y0 += rows;
         }
-        drop(mapped);
-        out_buf.unmap();
         out
+    }
+
+    /// Entwickelt ein ganzes Bild in Kacheln von hoechstens `kante` Pixeln —
+    /// fuer Bilder, die nicht in EINE Textur passen (Kante ueber 16384, z. B.
+    /// Panoramen) oder deren Rueckholung zu gross wird.
+    ///
+    /// Gleich wie ein Stueck entwickelt, weil alles Bildweite gemeinsam bleibt:
+    /// die Daten werden EINMAL fuer das ganze Bild vorbereitet (Retusche
+    /// eingeschlossen), Basisebene und Rauschpegel stammen aus dem ganzen Bild,
+    /// und jede Kachel entzerrt im vollen Bildbezug (`als_ausschnitt`). Der Rand
+    /// um jede Kachel deckt Nachbarschaftsfilter und Entzerrung ab — wie beim
+    /// 1:1-Ausschnitt der Oberflaeche.
+    #[allow(clippy::too_many_arguments)]
+    pub fn kachelweise(
+        gpu: &Gpu,
+        img: &rawcore::RawImage,
+        retusche: &Retusche,
+        edit: &Edit,
+        objektiv: objektiv::Objektiv,
+        kante: u32,
+        sechzehn: bool,
+    ) -> Result<Gerendert, GpuError> {
+        let (w, h, data) = Self::vorbereiten(img, None, retusche)?;
+        let quelle = Arc::new(basis::BasisQuelle::aus_f16(&data, w, h));
+        let rausch = rauschpegel_messen(&data, w, h);
+        let halbdiag = (w as f32).hypot(h as f32) / 2.0;
+        let winkel = edit.straighten.to_radians().abs();
+        let rand = (128.0 + objektiv.max_verschiebung(w, h) + 2.0 * (winkel / 2.0).sin() * halbdiag).ceil() as u32;
+        let kante = kante.max(256);
+        let kanaele = if sechzehn { 3 } else { 4 };
+        let mut aus8 = if sechzehn { Vec::new() } else { vec![0u8; w as usize * h as usize * 4] };
+        let mut aus16 = if sechzehn { vec![0u16; w as usize * h as usize * 3] } else { Vec::new() };
+        for ky in (0..h).step_by(kante as usize) {
+            for kx in (0..w).step_by(kante as usize) {
+                let (kw, kh) = (kante.min(w - kx), kante.min(h - ky));
+                let (rx, ry) = (kx.saturating_sub(rand), ky.saturating_sub(rand));
+                let (rw, rh) = ((kx + kw + rand).min(w) - rx, (ky + kh + rand).min(h) - ry);
+                let mut teil = vec![0u16; rw as usize * rh as usize * 4];
+                for z in 0..rh as usize {
+                    let q = ((ry as usize + z) * w as usize + rx as usize) * 4;
+                    teil[z * rw as usize * 4..(z + 1) * rw as usize * 4].copy_from_slice(&data[q..q + rw as usize * 4]);
+                }
+                let mut stueck = Self::from_f16(gpu, rw, rh, &teil, &img.meta, Some(quelle.clone()), 1.0)?;
+                stueck.rauschpegel = rausch;
+                stueck.als_ausschnitt(rx, ry, w, h, objektiv);
+                let (ox, oy) = ((kx - rx) as usize, (ky - ry) as usize);
+                if sechzehn {
+                    let px = stueck.render16(gpu, edit);
+                    for z in 0..kh as usize {
+                        let q = ((oy + z) * rw as usize + ox) * kanaele;
+                        let d = ((ky as usize + z) * w as usize + kx as usize) * kanaele;
+                        aus16[d..d + kw as usize * kanaele].copy_from_slice(&px[q..q + kw as usize * kanaele]);
+                    }
+                } else {
+                    let px = stueck.render(gpu, edit);
+                    for z in 0..kh as usize {
+                        let q = ((oy + z) * rw as usize + ox) * kanaele;
+                        let d = ((ky as usize + z) * w as usize + kx as usize) * kanaele;
+                        aus8[d..d + kw as usize * kanaele].copy_from_slice(&px[q..q + kw as usize * kanaele]);
+                    }
+                }
+            }
+        }
+        Ok(if sechzehn { Gerendert::Rgb16 { w, h, px: aus16 } } else { Gerendert::Rgba8 { w, h, px: aus8 } })
     }
 
     /// Wie `render`, gibt aber **16 Bit je Kanal** zurueck (RGB, verschraenkt, sRGB-kodiert).
@@ -1189,13 +1289,17 @@ impl GpuImage {
         let mut enc = gpu
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        // Getrennte Durchgaenge wie in `durchgaenge` (Lesen nach Schreiben).
+        let gx = self.width.div_ceil(8);
+        let gy = self.height.div_ceil(8);
         {
             let mut pass = enc.begin_compute_pass(&Default::default());
-            let gx = self.width.div_ceil(8);
-            let gy = self.height.div_ceil(8);
             pass.set_pipeline(&gpu.develop);
             pass.set_bind_group(0, &g1, &[]);
             pass.dispatch_workgroups(gx, gy, 1);
+        }
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
             pass.set_pipeline(&gpu.output16);
             pass.set_bind_group(0, &g2, &[]);
             pass.dispatch_workgroups(gx, gy, 1);
@@ -1694,6 +1798,39 @@ fn geo_uniform(edit: &Edit) -> [f32; 4] {
     // Massstab am Bildrand: ohne ihn schiebt die Entzerrung schwarze Raender ins
     // Bild (k > 0) oder verschenkt Bildflaeche (k < 0).
     [winkel, k, 1.0, aktiv]
+}
+
+/// Alles, was vor den Reglern in die Rohdaten eingreift: kopierte Stellen
+/// (`heal`), vom Retusche-Modell gefuellte (`heal_ki`) und eingesetzte Stuecke
+/// (`zusatz`). Koordinaten jeweils als Anteile des Bildes, in das sie gehoeren.
+#[derive(Debug, Clone, Copy)]
+pub struct Retusche<'a> {
+    pub heal: &'a [[f32; 3]],
+    pub heal_ki: &'a [[f32; 3]],
+    pub zusaetze: &'a [zusatz::Stueck],
+}
+
+impl Retusche<'_> {
+    pub const LEER: Retusche<'static> = Retusche { heal: &[], heal_ki: &[], zusaetze: &[] };
+
+    /// Erst kopierte Stellen, dann KI-Fuellung, dann eingesetzte Stuecke. Fehlt
+    /// das Retusche-Modell oder rechnet es nicht, werden die KI-Stellen klassisch
+    /// geschlossen — eine markierte Stelle bleibt nie einfach stehen.
+    pub fn anwenden(&self, data: &mut [u16], w: u32, h: u32) {
+        if !self.heal.is_empty() {
+            heal::anwenden(data, w, h, &heal::aus_edit(self.heal, w, h));
+        }
+        if !self.heal_ki.is_empty() {
+            let flecken = heal::aus_edit(self.heal_ki, w, h);
+            if let Err(e) = heal_ki::anwenden(data, w, h, &flecken) {
+                eprintln!("KI-Fuellung nicht moeglich ({e}) — klassisch geschlossen");
+                heal::anwenden(data, w, h, &flecken);
+            }
+        }
+        for z in self.zusaetze {
+            zusatz::einsetzen(data, w, h, z);
+        }
+    }
 }
 
 /// Wandelt die 16-Bit-Ganzzahlen aus `rawcore` in halbe Gleitkommazahlen und

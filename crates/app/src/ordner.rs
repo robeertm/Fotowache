@@ -30,6 +30,9 @@ enum System {
 enum Art {
     Ablage,
     Einstellungen,
+    /// Grosse Dateien, die bleiben sollen (lokale KI, mehrere GB). Unter Windows
+    /// bewusst NICHT im wandernden Profil — das wuerde sonst mitsynchronisiert.
+    Daten,
 }
 
 fn dieses_system() -> System {
@@ -53,6 +56,12 @@ pub fn ablage() -> PathBuf {
 /// keinen nennt — dann wird eben nichts gespeichert.
 pub fn einstellungen() -> Option<PathBuf> {
     ordner(dieses_system(), Art::Einstellungen, &|k: &str| std::env::var_os(k))
+}
+
+/// Ordner fuer grosse, bleibende Daten (lokale KI). `None`, wenn das System
+/// keinen nennt.
+pub fn daten() -> Option<PathBuf> {
+    ordner(dieses_system(), Art::Daten, &|k: &str| std::env::var_os(k))
 }
 
 /// Ordner aus der Zeit vor dem Namen „Fotowache" (bis 2.0: FotoRaw) einmalig
@@ -100,6 +109,11 @@ fn ordner(system: System, art: Art, umgebung: &dyn Fn(&str) -> Option<OsString>)
         }
         (System::Windows, Art::Ablage) => wert("LOCALAPPDATA").map(|d| d.join("Fotowache").join("Cache")),
         (System::Windows, Art::Einstellungen) => wert("APPDATA").map(|d| d.join("Fotowache")),
+        (System::Mac, Art::Daten) => wert("HOME").map(|h| h.join("Library/Application Support/Fotowache")),
+        (System::Windows, Art::Daten) => wert("LOCALAPPDATA").map(|d| d.join("Fotowache")),
+        (System::Xdg, Art::Daten) => xdg("XDG_DATA_HOME")
+            .map(|d| d.join("fotowache"))
+            .or_else(|| wert("HOME").map(|h| h.join(".local").join("share").join("fotowache"))),
         (System::Xdg, Art::Ablage) => xdg("XDG_CACHE_HOME")
             .map(|d| d.join("fotowache"))
             .or_else(|| wert("HOME").map(|h| h.join(".cache").join("fotowache"))),
@@ -217,5 +231,20 @@ mod tests {
         let neu = unter(&home, &[".config", "fotowache"]);
         assert_eq!(alter_ort(&neu), Some((unter(&home, &[".config", "fotoraw"]), neu.clone())));
         assert_eq!(alter_ort(&home), None);
+    }
+
+    #[test]
+    fn daten_liegen_lokal_und_nicht_im_wandernden_profil() {
+        let lokal = absolut(&["Users", "n", "AppData", "Local"]);
+        let wandernd = absolut(&["Users", "n", "AppData", "Roaming"]);
+        let u = |k: &str| match k {
+            "LOCALAPPDATA" => Some(lokal.clone().into_os_string()),
+            "APPDATA" => Some(wandernd.clone().into_os_string()),
+            _ => None,
+        };
+        assert_eq!(ordner(System::Windows, Art::Daten, &u), Some(unter(&lokal, &["Fotowache"])));
+        let home = absolut(&["home", "n"]);
+        let x = |k: &str| (k == "HOME").then(|| home.clone().into_os_string());
+        assert_eq!(ordner(System::Xdg, Art::Daten, &x), Some(unter(&home, &[".local", "share", "fotowache"])));
     }
 }

@@ -245,6 +245,64 @@ impl Objektiv {
         groesste
     }
 
+    /// Wohin ein Pixel des korrigierten Bilds im aufgenommenen Bild faellt — fuer
+    /// Rot, Gruen und Blau getrennt (Farbsaeume). Rechnet genau wie
+    /// `quelle_gruen` und der Farbsaum-Schritt in `develop.wgsl` (ohne manuelle
+    /// Entzerrung und Geraderichten). `p` in Pixeln, Bildgroesse `breite` x `hoehe`.
+    pub fn quelle(&self, p: [f32; 2], breite: f32, hoehe: f32) -> [[f32; 2]; 3] {
+        let mitte = [breite * 0.5, hoehe * 0.5];
+        let halbdiag = (mitte[0] * mitte[0] + mitte[1] * mitte[1]).sqrt().max(1.0);
+        let mut d = [p[0] - mitte[0], p[1] - mitte[1]];
+        let laenge = |d: [f32; 2]| (d[0] * d[0] + d[1] * d[1]).sqrt();
+        if let Some(rad) = &self.radial {
+            d = [d[0] * rad.fuell, d[1] * rad.fuell];
+            let m = rad.m_an(laenge(d) / halbdiag);
+            d = [d[0] * m, d[1] * m];
+        }
+        if self.abc != [0.0; 3] {
+            let r = laenge(d) / mitte[0].min(mitte[1]).max(1.0);
+            let f = ptlens(self.abc, r) * self.skala;
+            d = [d[0] * f, d[1] * f];
+        }
+        let g = [mitte[0] + d[0], mitte[1] + d[1]];
+        let (mut r, mut b) = (g, g);
+        if let Some(rad) = &self.radial {
+            let rq = laenge(d) / halbdiag;
+            let ca_r = 1.0 + Radial::lerp(&rad.r_quelle[..rad.n], &rad.ca_r[..rad.n], rq);
+            let ca_b = 1.0 + Radial::lerp(&rad.r_quelle[..rad.n], &rad.ca_b[..rad.n], rq);
+            r = [mitte[0] + d[0] * ca_r, mitte[1] + d[1] * ca_r];
+            b = [mitte[0] + d[0] * ca_b, mitte[1] + d[1] * ca_b];
+        }
+        [r, g, b]
+    }
+
+    /// Ausgleich der Randabdunklung an einer Stelle des AUFGENOMMENEN Bilds
+    /// (Kameradaten der RAF; ohne sie 1). Wie Schritt 2 in `develop.wgsl`.
+    pub fn rand_gain(&self, q: [f32; 2], breite: f32, hoehe: f32) -> f32 {
+        match &self.radial {
+            Some(rad) => {
+                let (hx, hy) = (breite * 0.5, hoehe * 0.5);
+                let rq = ((q[0] - hx).powi(2) + (q[1] - hy).powi(2)).sqrt() / (hx * hx + hy * hy).sqrt().max(1.0);
+                rad.gain_an(rq).max(0.1)
+            }
+            None => 1.0,
+        }
+    }
+
+    /// Vergroesserung der Bildmitte durch die Korrektur (korrigiert / aufgenommen):
+    /// die Brennweite in Pixeln des korrigierten Bilds ist die der Aufnahme mal
+    /// diesen Wert.
+    pub fn mitten_vergroesserung(&self) -> f32 {
+        let mut f = 1.0f32;
+        if let Some(rad) = &self.radial {
+            f *= rad.fuell * rad.m_an(0.0);
+        }
+        if self.abc != [0.0; 3] {
+            f *= ptlens(self.abc, 0.0) * self.skala;
+        }
+        1.0 / f.max(1e-6)
+    }
+
     pub fn aktiv(&self) -> bool {
         self.abc != [0.0; 3] || self.devignette > 0.0 || self.radial.is_some()
     }
@@ -746,6 +804,27 @@ mod tests {
         let (abc, quelle) = verzeichnung("18-300mm F/3.5-6.3 DiIII-A VC VXD B061X", 18.0, 1.534);
         assert_eq!(quelle, ObjektivQuelle::Profil);
         assert!((abc[0] - 0.02805).abs() < 1e-5);
+    }
+
+    #[test]
+    fn cpu_abbildung_rechnet_wie_das_ptlens_modell() {
+        let abc = [0.01, -0.03, 0.0];
+        let o = Objektiv { abc, skala: fuellmassstab(abc, 600, 400), ..Objektiv::default() };
+        // Die Mitte bleibt, wo sie ist; ohne Farbsaum-Daten alle Kanaele gleich.
+        let m = o.quelle([300.0, 200.0], 600.0, 400.0);
+        assert!((m[1][0] - 300.0).abs() < 1e-4 && (m[1][1] - 200.0).abs() < 1e-4);
+        assert_eq!(m[0], m[1]);
+        // Ein Randpunkt: Abstand = Zielabstand · p(r) · Fuellmassstab, r auf die kleinere Halbseite.
+        let q = o.quelle([500.0, 200.0], 600.0, 400.0)[1];
+        let soll = 200.0 * ptlens(abc, 200.0 / 200.0) * o.skala;
+        assert!((q[0] - 300.0 - soll).abs() < 1e-3, "{} {}", q[0] - 300.0, soll);
+        // Vergroesserung der Mitte passt zur Abbildung kleiner Abstaende.
+        let klein = o.quelle([301.0, 200.0], 600.0, 400.0)[1][0] - 300.0;
+        assert!((1.0 / klein - o.mitten_vergroesserung()).abs() < 1e-3);
+        // Ohne Profil: unveraendert, kein Randausgleich.
+        let leer = Objektiv::default();
+        assert_eq!(leer.quelle([12.0, 34.0], 600.0, 400.0)[2], [12.0, 34.0]);
+        assert_eq!(leer.rand_gain([0.0, 0.0], 600.0, 400.0), 1.0);
     }
 
     #[test]

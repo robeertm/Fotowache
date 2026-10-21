@@ -19,6 +19,7 @@ use std::ffi::{c_char, c_float, c_int, c_uint, c_void, CStr, CString};
 use std::path::Path;
 
 pub mod dng;
+pub mod dng_schreiben;
 pub mod raf;
 
 mod ffi;

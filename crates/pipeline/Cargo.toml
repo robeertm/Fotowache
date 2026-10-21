@@ -14,4 +14,9 @@ thiserror = "2"
 pollster = "0.4"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 flate2 = "1"
+# Retusche-Modell (ONNX) in reinem Rust — keine native Laufzeit, keine DLL.
+tract-onnx = "0.23"
+# Panorama: Verzerren, Pyramiden und Paarvergleiche parallel ueber alle Kerne
+# (MIT/Apache-2.0, reines Rust; liegt ueber tract ohnehin schon im Baum).
+rayon = "1"
 
