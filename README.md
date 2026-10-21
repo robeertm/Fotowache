@@ -64,6 +64,10 @@ photo in milliseconds.
   white (V), crop and straighten (R), object removal brush (with AI fill), lossless
   rotate/flip, one undo step per slider drag (Ctrl/⌘ + Z), copy/paste settings
   between photos (Ctrl/⌘ + Shift + C / V).**
+- **Reset to how the photo was imported (Ctrl/⌘ + Shift + R):** next to
+  before/after, for all selected photos at once, per slider group (↺ next to
+  the group name) or per slider (double-click its name). Undo brings the edits
+  back.
 - **Film looks:** eleven film-style starting points (balanced, brilliant,
   gentle, muted, retro negative, filmic, fine black & white …) for cameras that
   write RAF files, plus exposure compensation for their extended dynamic range
@@ -90,6 +94,14 @@ everything runs on your own computer: no photo leaves it, no account, no cost.
 - **Image generator (bonus).** Create images from a description with an open
   image model, also fully local (separate download of about 5.2 GB, roughly one
   minute per image).
+- **Unrestricted mode (18+, optional).** A second open image model without a
+  content filter, for adults: it is unlocked only after confirming your age with
+  your date of birth (only the confirmation is stored, never the date). Fixed
+  limits that cannot be switched off: any description aimed at children or
+  teenagers is refused before the model starts, the model is always told that
+  everyone shown is an adult, and it only creates images from a description —
+  never from your own photos. Separate download of about 8.5 GB, roughly four
+  minutes per image.
 
 The local AI is not offered on systems whose C library is too old (glibc older
 than 2.38); the image generator needs a recent system version on every platform.
@@ -199,6 +211,7 @@ system's software renderer (slow, but it works).
 | Ctrl/⌘ + Z, Ctrl/⌘ + Shift + Z | Undo, redo |
 | Ctrl/⌘ + U | Auto tone |
 | Ctrl/⌘ + Shift + C / V | Copy / paste settings |
+| Ctrl/⌘ + Shift + R | Reset to how the photo was imported |
 | ← → or Space | Previous / next photo |
 | 1 – 5, 0 | Star rating, clear rating |
 | G / D | Gallery / develop view |

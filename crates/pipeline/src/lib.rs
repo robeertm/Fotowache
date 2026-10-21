@@ -700,6 +700,53 @@ impl GpuImage {
         Self::from_f16(gpu, w, h, &data, &img.meta, None, 1.0)
     }
 
+    /// Ein Ausschnitt fuer den Bildschirm: der Bereich `x, y, w, h` des vollen
+    /// Bildes, flaechentreu auf genau `ziel_b` × `ziel_h` verkleinert (jedes
+    /// Zielpixel mittelt die Sensorflaeche, die es abdeckt — auch Bruchteile).
+    ///
+    /// Wozu: die eingepasste Ansicht. Die Arbeitskopie fuers Regeln ist bewusst
+    /// klein (ganzzahlig geteilt: bei 7752 px nur 1938 px breit); ein HiDPI-
+    /// Bildschirm zeigt aber doppelt so viele Pixel je Punkt — aufgeblasen sah
+    /// jedes Foto weich aus (gemessen gegen die Referenz-Entwicklung bei
+    /// 0,2–0,3 Zyklen/px: 27 % der Feinzeichnung am 5K-Schirm, 32 % am
+    /// eingebauten). In Bildschirmaufloesung gerechnet: 95–98 %.
+    ///
+    /// Danach `als_ausschnitt_skaliert` + `basis_von` aufrufen.
+    #[allow(clippy::too_many_arguments)]
+    pub fn upload_region_verkleinert(
+        gpu: &Gpu,
+        img: &rawcore::RawImage,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+        ziel_b: u32,
+        ziel_h: u32,
+        retusche: &Retusche,
+    ) -> Result<Self, GpuError> {
+        let w = w.min(img.width.saturating_sub(x)).max(1);
+        let h = h.min(img.height.saturating_sub(y)).max(1);
+        let (ob, oh) = (ziel_b.clamp(1, w), ziel_h.clamp(1, h));
+        let mut data = flaechentreu_verkleinern(img, x, y, w, h, ob, oh);
+        retusche.anwenden(&mut data, ob, oh);
+        Self::from_f16(gpu, ob, oh, &data, &img.meta, None, ob as f32 / w as f32)
+    }
+
+    /// Wie `als_ausschnitt`, fuer einen verkleinerten Ausschnitt: Lage und
+    /// Bildgroesse in Pixeln DIESER Aufloesung (Sensorpixel × Massstab).
+    pub fn als_ausschnitt_skaliert(
+        &mut self,
+        x: f32,
+        y: f32,
+        voll_breite: f32,
+        voll_hoehe: f32,
+        objektiv: objektiv::Objektiv,
+    ) {
+        self.warp_offset = [x, y];
+        self.warp_voll = [voll_breite, voll_hoehe];
+        self.objektiv = objektiv;
+    }
+
     /// Das Objektiv, das fuer diesen Bearbeitungsstand wirklich gilt:
     /// automatisch erkannt, oder die feste Wahl aus dem Menue. Der
     /// Fuellmassstab wird auf die Masse des GANZEN Bildes gerechnet, damit
@@ -927,6 +974,20 @@ impl GpuImage {
         (edit.to_uniform(&k), tab, btex)
     }
 
+    /// Laeuft der erste Durchgang ueber die Entzerrung (Objektivkorrektur,
+    /// Geraderichten, Verzeichnung)? Dieselbe Bedingung wie `geometrie_aktiv()`
+    /// im Schader.
+    fn geometrie_aktiv(&self, edit: &Edit) -> bool {
+        if geo_uniform(edit)[3] > 0.5 {
+            return true;
+        }
+        if !edit.lens_auto {
+            return false;
+        }
+        let o = self.objektiv_wirksam(edit);
+        o.abc != [0.0; 3] || o.radial.is_some()
+    }
+
     /// Baut den Uniform-Block der zweiten Stufe fuer ein bestimmtes Ziel.
     ///
     /// Hier faellt die Entscheidung sRGB-oder-Bildschirm: eine Datei bekommt immer
@@ -960,7 +1021,8 @@ impl GpuImage {
                 // GRUENDLICH entrauschen.
                 (self.rauschpegel
                     * (edit.base_ev + edit.exposure / 50.0 + self.zusatz_ev()).exp2()
-                    / self.meta.weiss_pegel.max(0.05))
+                    / self.meta.weiss_pegel.max(0.05)
+                    * if self.geometrie_aktiv(edit) { NLM_NACH_ENTZERRUNG } else { 1.0 })
                 .clamp(0.0, 0.25),
             ],
             flags: [
@@ -1510,6 +1572,34 @@ mod schwarzpunkt_tests {
         let raw = testraw(px, w, h);
         assert_eq!(auto_blackpoint(&raw, 0.0), 0.0);
     }
+
+    /// Bildschirm-Ausschnitt: trifft die Zielgroesse genau (auch krumme
+    /// Teilungen), mittelt flaechentreu und laesst Helligkeit unveraendert.
+    #[test]
+    fn flaechentreu_trifft_jede_groesse() {
+        let (w, h) = (101u32, 67u32);
+        // Senkrechte Streifen 0 / 60000 im Wechsel: Mittel 30000.
+        let px: Vec<u16> = (0..w * h)
+            .flat_map(|i| {
+                let v = if (i % w) % 2 == 0 { 0 } else { 60000 };
+                [v, v, v]
+            })
+            .collect();
+        let raw = testraw(px, w, h);
+        let ziel = (37u32, 25u32);
+        let d = flaechentreu_verkleinern(&raw, 0, 0, w, h, ziel.0, ziel.1);
+        assert_eq!(d.len(), (ziel.0 * ziel.1 * 4) as usize);
+        let werte: Vec<f32> = d.chunks_exact(4).map(|p| half::f16::from_bits(p[1]).to_f32()).collect();
+        let mittel = werte.iter().sum::<f32>() / werte.len() as f32;
+        // Gesamtmittel bleibt (Rand: 101 Spalten = 51 dunkle, 50 helle).
+        let soll = 50.0 * 60000.0 / 101.0 / 65535.0;
+        assert!((mittel - soll).abs() < 0.01, "Mittel {mittel} statt {soll}");
+        // Jede Zelle deckt ~2,7 Spalten ab: nirgends reines Schwarz/Weiss.
+        assert!(werte.iter().all(|v| *v > 0.2 && *v < 0.75), "nicht flaechentreu gemittelt");
+        // Teilausschnitt mit Versatz: dieselbe Stelle, dieselbe Groesse.
+        let t = flaechentreu_verkleinern(&raw, 10, 5, 50, 40, 25, 20);
+        assert_eq!(t.len(), 25 * 20 * 4);
+    }
 }
 
 /// Automatischer Schwarzpunkt — was die Automatik der Referenz-Entwicklung den
@@ -1787,6 +1877,20 @@ fn uniform_buffer(device: &wgpu::Device, bytes: &[u8]) -> wgpu::Buffer {
 /// die sind reine Umsortierung von Pixeln und werden nach dem Rueckholen exakt
 /// umgestellt. Ueber die Grafikkarte gedreht, muesste jedes Bild neu abgetastet
 /// werden — Schaerfeverlust fuer eine Operation, die verlustfrei sein kann.
+/// Filterbreite der Rauschminderung hinter der Entzerrung.
+///
+/// Die Rauschminderung ist an RAF-Fotos eingemessen worden, und die liefen
+/// immer durch die Entzerrung — damals bilinear. Bilineares Nachrechnen glaettet
+/// das Rauschen schon mit; seit Lanczos-3 kommt es ungeglaettet an. Damit die
+/// Rauschminderung so gruendlich bleibt wie eingemessen, waechst ihre
+/// Filterbreite hinter der Entzerrung. Gemessen an DSCF1632 (ISO 4000,
+/// Rauschminderung 40/45, 60 flache Kacheln, Hochpass-Streuung in 8-Bit-Stufen):
+/// bilinear 4,58 · Lanczos ohne Ausgleich 7,78 · Faktor 1,33 → 5,76 ·
+/// **1,6 → 4,39** (Farbgesprenkel 2,70 → 2,47), und die Zeichnung in den
+/// strukturierten Kacheln bleibt dabei ueber dem alten Stand (0,94/1,10/1,16).
+/// Ohne Entzerrung gilt die alte Eichung unveraendert.
+const NLM_NACH_ENTZERRUNG: f32 = 1.6;
+
 fn geo_uniform(edit: &Edit) -> [f32; 4] {
     let winkel = edit.straighten.to_radians();
     let k = edit.lens_distort / 100.0 * 0.35;
@@ -1837,6 +1941,74 @@ impl Retusche<'_> {
 /// verkleinert dabei optional. Die Verkleinerung mittelt echte Pixelbloecke
 /// (Kastenfilter) statt Pixel wegzulassen — sonst flimmern feine Strukturen und
 /// Rauschen wird schlimmer statt besser.
+/// Bereich `x, y, w, h` flaechentreu auf `ob` × `oh` verkleinern (RGBA f16,
+/// Werte 0..1). Jedes Zielpixel mittelt die Quellflaeche, die es abdeckt —
+/// angeschnittene Randpixel mit ihrem Anteil. Anders als die ganzzahlige
+/// Teilung in `to_rgba_f16` trifft das jede Zielgroesse genau.
+fn flaechentreu_verkleinern(img: &rawcore::RawImage, x: u32, y: u32, w: u32, h: u32, ob: u32, oh: u32) -> Vec<u16> {
+    // Je Zielspalte bzw. -zeile: (erstes Quellpixel, Gewichte) — einmal
+    // ausgerechnet, fuer alle Zeilen gleich.
+    let anteile = |quelle: u32, ziel: u32, versatz: u32| -> Vec<(usize, Vec<f32>)> {
+        let f = quelle as f64 / ziel as f64;
+        (0..ziel)
+            .map(|o| {
+                let a = o as f64 * f;
+                let b = ((o + 1) as f64 * f).min(quelle as f64);
+                let erstes = a.floor() as u32;
+                let letztes = (b.ceil() as u32).min(quelle).max(erstes + 1);
+                let gew: Vec<f32> = (erstes..letztes)
+                    .map(|q| ((q as f64 + 1.0).min(b) - (q as f64).max(a)).max(0.0) as f32)
+                    .collect();
+                let summe: f32 = gew.iter().sum::<f32>().max(1e-9);
+                ((versatz + erstes) as usize, gew.into_iter().map(|g| g / summe).collect())
+            })
+            .collect()
+    };
+    let spalten = anteile(w, ob, x);
+    let zeilen = anteile(h, oh, y);
+    let breite = img.width as usize;
+    let mut out = vec![0u16; (ob as usize) * (oh as usize) * 4];
+    let skala = 1.0f32 / 65535.0;
+    let eins = half::f16::from_f32(1.0).to_bits();
+    let kerne = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(oh as usize).max(1);
+    let zeilen_je = (oh as usize).div_ceil(kerne);
+    std::thread::scope(|s| {
+        for (b, band) in out.chunks_mut(zeilen_je * ob as usize * 4).enumerate() {
+            let (spalten, zeilen) = (&spalten, &zeilen);
+            s.spawn(move || {
+                let mut zeile_acc = vec![[0f32; 3]; ob as usize];
+                for (dy, ziel) in band.chunks_exact_mut(ob as usize * 4).enumerate() {
+                    let (y0, gy) = &zeilen[b * zeilen_je + dy];
+                    zeile_acc.iter_mut().for_each(|a| *a = [0.0; 3]);
+                    for (j, wy) in gy.iter().enumerate() {
+                        let reihe = (y0 + j) * breite;
+                        for (o, (x0, gx)) in spalten.iter().enumerate() {
+                            let mut acc = [0f32; 3];
+                            for (i, wx) in gx.iter().enumerate() {
+                                let p = (reihe + x0 + i) * 3;
+                                acc[0] += img.pixels[p] as f32 * wx;
+                                acc[1] += img.pixels[p + 1] as f32 * wx;
+                                acc[2] += img.pixels[p + 2] as f32 * wx;
+                            }
+                            let z = &mut zeile_acc[o];
+                            z[0] += acc[0] * wy;
+                            z[1] += acc[1] * wy;
+                            z[2] += acc[2] * wy;
+                        }
+                    }
+                    for (o, a) in zeile_acc.iter().enumerate() {
+                        for c in 0..3 {
+                            ziel[o * 4 + c] = half::f16::from_f32(a[c] * skala).to_bits();
+                        }
+                        ziel[o * 4 + 3] = eins;
+                    }
+                }
+            });
+        }
+    });
+    out
+}
+
 fn to_rgba_f16(img: &rawcore::RawImage, max_dim: Option<u32>) -> (u32, u32, Vec<u16>) {
     let (sw, sh) = (img.width, img.height);
     let step = match max_dim {
