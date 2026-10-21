@@ -97,8 +97,11 @@ than 2.38); the image generator needs a recent system version on every platform.
 ### Panorama
 - **Select two or more photos in the gallery, then click Panorama…** Fotowache
   finds the overlaps itself (order does not matter, photos that do not belong are
-  left out and named in the report), aligns all photos together, estimates the
-  focal length and lens distortion, matches brightness and hides the seams.
+  left out and named in the report), corrects the lens, aligns all photos
+  together, straightens the horizon, matches brightness and hides the seams —
+  moving people come from one photo only.
+- **Parallax correction** for handheld series: nearby and distant objects are
+  brought into line along the seams while straight lines stay straight.
 - **Projections:** cylinder (one horizontal row), sphere (very wide or several
   rows) or flat (few photos, straight lines stay straight).
 - **Edges:** crop automatically to the largest fully covered rectangle, or let
@@ -107,7 +110,8 @@ than 2.38); the image generator needs a recent system version on every platform.
   it with every slider, the automatic settings or the AI, retouch it, and
   adjust the suggested crop with the crop tool (R).
 - **Command line:** `fotowache --panorama <files…> [--projektion
-  zylinder|kugel|eben] [--raender-fuellen] [--ohne-zuschnitt] [--voll]`.
+  zylinder|kugel|eben] [--raender-fuellen] [--ohne-zuschnitt] [--ohne-parallaxe]
+  [--voll]`.
 
 ### Almost every camera, every lens
 - **Reads RAW files from more than a thousand camera models** — compact
