@@ -2,6 +2,31 @@
 
 All notable changes to Fotowache. Versions follow [Semantic Versioning](https://semver.org/).
 
+## [2.2.1] - 2026-10-21
+
+### Fixes
+- **Crash when opening a photo:** clicking a thumbnail could close the app
+  instantly. The multi-core runtime used by the raw decoder
+  shut itself down whenever the thread that had used it last ended, and the
+  next photo's decoder then accessed a lock that no longer existed. The main
+  thread now keeps the runtime alive for the whole session.
+- **Reset gave no feedback:** the confirmation in the status bar was replaced
+  by the photo counter at the next automatic save, a few milliseconds later,
+  so a reset looked as if nothing had happened. Messages now stay visible for
+  a few seconds; the same applied to resetting several selected photos.
+- **Image generator window slowed the interface:** it checked the system
+  version by starting a helper program on every redraw. The result is now
+  determined once.
+
+### Image generator
+- **Unrestricted mode creates photos by default:** without a style in the
+  description the open model tended to paint (illustration and comic look,
+  with German and English descriptions alike). It is now asked for a
+  photograph unless the description names a drawing style such as comic,
+  drawing, painting or watercolour. A hint in the window says so.
+- Descriptions in English are understood more precisely by this model than
+  other languages.
+
 ## [2.2.0] - 2026-10-21
 
 ### Reset

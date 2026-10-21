@@ -18,6 +18,7 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=LIBRAW_DIR");
     println!("cargo:rerun-if-env-changed=PKG_CONFIG_PATH");
+    println!("cargo::rustc-check-cfg=cfg(mit_openmp)");
 
     let mut build = cc::Build::new();
     build.file("csrc/shim.c");
@@ -72,6 +73,10 @@ fn statisch(build: &mut cc::Build, dir: &Path) {
     for abh in ["jpeg", "lcms2", "jasper", "omp", "gomp"] {
         if liegt_da(&lib, abh) {
             println!("cargo:rustc-link-lib=static={abh}");
+            if abh.ends_with("omp") {
+                // Schaltet `openmp_festhalten` scharf (siehe lib.rs).
+                println!("cargo:rustc-cfg=mit_openmp");
+            }
         }
     }
     // zlib heisst je nach Version und Bauweise anders: libz.a, zlib.lib oder
@@ -125,6 +130,9 @@ fn dynamisch(build: &mut cc::Build) {
                     ("stdc++", "macos") => "c++",
                     (other, _) => other,
                 };
+                if name.ends_with("omp") {
+                    println!("cargo:rustc-cfg=mit_openmp");
+                }
                 println!("cargo:rustc-link-lib={name}");
             }
         }
