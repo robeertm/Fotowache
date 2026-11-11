@@ -2,6 +2,14 @@
 
 All notable changes to Fotowache. Versions follow [Semantic Versioning](https://semver.org/).
 
+## [2.2.2] - 2026-11-11
+
+### Fixes
+- **Command line image generator:** a relative output path (`--ziel bild.png`)
+  was written into the runtime's own folder, and the command reported a
+  failure although the image had been created. Output paths are now resolved
+  against the current folder.
+
 ## [2.2.1] - 2026-10-21
 
 ### Fixes

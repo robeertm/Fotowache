@@ -200,6 +200,9 @@ impl Format {
 
 /// Erzeugt ein Bild als PNG nach `ziel`. Dauert rund eine Minute.
 pub fn erzeugen(beschreibung: &str, format: Format, seed: u64, ziel: &Path) -> Result<(), String> {
+    // Absolut machen: die Laufzeit startet in ihrem eigenen Ordner, ein
+    // relativer Pfad (Kommandozeile `--ziel bild.png`) landete sonst dort.
+    let ziel = &std::path::absolute(ziel).unwrap_or_else(|_| ziel.to_path_buf());
     let programm = cli().ok_or_else(|| t("Der Bildgenerator ist nicht installiert.").to_string())?;
     let o = ordner().ok_or_else(|| t("Kein Datenordner gefunden.").to_string())?;
     let (w, h) = format.masse();
@@ -529,6 +532,9 @@ pub fn frei_auftrag(beschreibung: &str) -> String {
 /// Erzeugt ein Bild mit dem freien Modell. Gesperrte Beschreibungen kommen gar
 /// nicht erst bei der Laufzeit an.
 pub fn frei_erzeugen(beschreibung: &str, format: Format, seed: u64, ziel: &Path) -> Result<(), String> {
+    // Absolut machen: die Laufzeit startet in ihrem eigenen Ordner, ein
+    // relativer Pfad (Kommandozeile `--ziel bild.png`) landete sonst dort.
+    let ziel = &std::path::absolute(ziel).unwrap_or_else(|_| ziel.to_path_buf());
     if !volljaehrig_bestaetigt() {
         return Err(t("Der freie Modus braucht zuerst die Bestätigung, dass du volljährig bist.").into());
     }
