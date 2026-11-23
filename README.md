@@ -153,9 +153,13 @@ than 2.38); the image generator needs a recent system version on every platform.
 - **Command line:** `fotowache --stapel <folder|files…> [--ziel <folder>]
   [--breite <pixels>] [--tiff | --png]` develops without opening a window.
 
-| Gallery with ratings and filters | Batch export of a whole folder |
-|---|---|
-| ![Gallery](docs/screenshots/gallery.jpg) | ![Batch export](docs/screenshots/batch.jpg) |
+**Gallery with ratings and filters**
+
+![Gallery with ratings and filters](docs/screenshots/gallery.jpg)
+
+**Batch export of a whole folder**
+
+![Batch export of a whole folder](docs/screenshots/batch.jpg)
 
 ## Install
 
